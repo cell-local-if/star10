@@ -132,6 +132,31 @@ class AuditLog:
             return {"index": entry.index, "entry_hash": entry.hash, "size": len(leaves),
                     "root": merkle_root(leaves), "proof": inclusion_proof(leaves, entry.index)}
 
+    def proofs(self, snapshot_size: int, start: int, limit: int) -> dict[str, Any]:
+        """Inclusion proofs for one page of a fixed entry prefix.
+
+        The prefix, its Merkle root and every proof are derived from one locked read, so concurrent
+        appends can only extend the log; they never change the result for an old snapshot_size.
+        """
+        with self._lock:
+            if not 1 <= limit <= 100:
+                raise InvalidRequest("limit must be between 1 and 100")
+            if snapshot_size > len(self._entries):
+                raise InvalidRequest(f"log has fewer than {snapshot_size} entries")
+            if start > snapshot_size:
+                raise InvalidRequest("start must not exceed snapshot_size")
+            leaves = [e.hash for e in self._entries[:snapshot_size]]
+            root = merkle_root(leaves)
+            count = min(limit, snapshot_size - start)
+            page = [
+                {"index": index, "entry_hash": leaves[index], "size": snapshot_size, "root": root,
+                 "proof": inclusion_proof(leaves, index)}
+                for index in range(start, start + count)
+            ]
+            end = start + count
+            return {"snapshot_size": snapshot_size, "root": root, "start": start, "count": count,
+                    "next_start": end if end < snapshot_size else None, "proofs": page}
+
     def size(self) -> int:
         with self._lock:
             return len(self._entries)
@@ -173,6 +198,35 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
         def _parts(self) -> list[str]:
             return [p for p in self.path.split("?")[0].split("/") if p]
 
+        def _proofs_query(self) -> tuple[int, int, int]:
+            """Parse the paged-proofs query string; every malformed case is invalid_request."""
+            raw_query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            if not raw_query:
+                raise InvalidRequest("snapshot_size, start and limit are required")
+            values: dict[str, list[str]] = {}
+            for piece in raw_query.split("&"):
+                if "=" not in piece:
+                    raise InvalidRequest("query parameters must be name=value")
+                name, value = piece.split("=", 1)
+                values.setdefault(name, []).append(value)
+            required = ("snapshot_size", "start", "limit")
+            unknown = set(values) - set(required)
+            if unknown or any(len(values[name]) != 1 for name in required if name in values) or \
+                    any(name not in values for name in required):
+                raise InvalidRequest("snapshot_size, start and limit must each appear exactly once")
+
+            def decimal(name: str) -> int:
+                text = values[name][0]
+                if not text or not text.isascii() or not text.isdigit():
+                    raise InvalidRequest(f"{name} must be a decimal integer")
+                return int(text)
+
+            snapshot_size, start = decimal("snapshot_size"), decimal("start")
+            limit = decimal("limit")
+            if not 1 <= limit <= 100:
+                raise InvalidRequest("limit must be between 1 and 100")
+            return snapshot_size, start, limit
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
@@ -184,6 +238,9 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, log.entry(int(parts[2]) if parts[2].isdigit() else parts[2]).as_json())
                 if len(parts) == 4 and parts[:3] == ["v1", "proof", "inclusion"]:
                     return self._send(200, log.proof(int(parts[3]) if parts[3].isdigit() else parts[3]))
+                if parts == ["v1", "proofs", "inclusion"]:
+                    snapshot_size, start, limit = self._proofs_query()
+                    return self._send(200, log.proofs(snapshot_size, start, limit))
                 return self._send(404, {"error": {"code": "not_found"}})
             except AuditError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
