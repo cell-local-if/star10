@@ -94,6 +94,35 @@ class Entry:
 ZERO = "0" * 64
 
 
+# Strict decimal: one or more ASCII digits only — no sign, whitespace, fraction, exponent or other radix.
+def _decimal_int(raw: str, name: str) -> int:
+    if not raw or not all("0" <= ch <= "9" for ch in raw):
+        raise InvalidRequest(f"{name} must be a non-negative decimal integer")
+    return int(raw)
+
+
+def parse_proofs_query(query: str) -> tuple[int, int, int]:
+    """Parse the proofs query string: exactly one snapshot_size/start/limit and nothing else."""
+    if not query:
+        raise InvalidRequest("snapshot_size, start and limit are required")
+    values: dict[str, str] = {}
+    for pair in query.split("&"):
+        if not pair or "=" not in pair:
+            raise InvalidRequest("malformed query string")
+        key, value = pair.split("=", 1)
+        if key not in {"snapshot_size", "start", "limit"}:
+            raise InvalidRequest(f"unknown query parameter: {key}")
+        if key in values:
+            raise InvalidRequest(f"query parameter {key} must appear exactly once")
+        values[key] = value
+    missing = {"snapshot_size", "start", "limit"} - values.keys()
+    if missing:
+        raise InvalidRequest("snapshot_size, start and limit are required")
+    return (_decimal_int(values["snapshot_size"], "snapshot_size"),
+            _decimal_int(values["start"], "start"),
+            _decimal_int(values["limit"], "limit"))
+
+
 class AuditLog:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -131,6 +160,37 @@ class AuditLog:
             entry = self.entry(index)
             return {"index": entry.index, "entry_hash": entry.hash, "size": len(leaves),
                     "root": merkle_root(leaves), "proof": inclusion_proof(leaves, entry.index)}
+
+    def proofs_page(self, snapshot_size: Any, start: Any, limit: Any) -> dict[str, Any]:
+        """Inclusion proofs for one page of a fixed entry prefix.
+
+        The prefix (its leaves, root and every proof) is determined under a single lock acquisition,
+        so concurrent appends can only enlarge the log; they never change an existing snapshot.
+        """
+        if not all(isinstance(value, int) and not isinstance(value, bool)
+                   for value in (snapshot_size, start, limit)):
+            raise InvalidRequest("snapshot_size, start and limit must be integers")
+        if snapshot_size < 0 or start < 0:
+            raise InvalidRequest("snapshot_size and start must be non-negative integers")
+        if not 1 <= limit <= 100:
+            raise InvalidRequest("limit must be between 1 and 100")
+        with self._lock:
+            if snapshot_size > len(self._entries):
+                raise InvalidRequest(f"log has fewer than {snapshot_size} entries")
+            if start > snapshot_size:
+                raise InvalidRequest("start must not exceed snapshot_size")
+            leaves = [entry.hash for entry in self._entries[:snapshot_size]]
+            root = merkle_root(leaves)
+            end = min(start + limit, snapshot_size)
+            proofs = [
+                {"index": index, "entry_hash": leaves[index], "size": snapshot_size,
+                 "root": root, "proof": inclusion_proof(leaves, index)}
+                for index in range(start, end)
+            ]
+            count = end - start
+            cursor = start + count
+            return {"snapshot_size": snapshot_size, "root": root, "start": start, "count": count,
+                    "next_start": cursor if cursor < snapshot_size else None, "proofs": proofs}
 
     def size(self) -> int:
         with self._lock:
@@ -184,6 +244,9 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, log.entry(int(parts[2]) if parts[2].isdigit() else parts[2]).as_json())
                 if len(parts) == 4 and parts[:3] == ["v1", "proof", "inclusion"]:
                     return self._send(200, log.proof(int(parts[3]) if parts[3].isdigit() else parts[3]))
+                if self.path.split("?", 1)[0] == "/v1/proofs/inclusion":
+                    snapshot_size, start, limit = parse_proofs_query(self.path.split("?", 1)[1] if "?" in self.path else "")
+                    return self._send(200, log.proofs_page(snapshot_size, start, limit))
                 return self._send(404, {"error": {"code": "not_found"}})
             except AuditError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})

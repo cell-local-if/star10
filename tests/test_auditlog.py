@@ -109,5 +109,154 @@ class HttpSurfaceTests(unittest.TestCase):
         self.assertEqual(self.call("GET", "/nope")[0], 404)
 
 
+class PagedProofsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from auditlog import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.log = cls.server.log
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        with self.log._lock:
+            self.log._entries.clear()
+
+    def call(self, path: str):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def append(self, n: int) -> None:
+        for i in range(n):
+            self.log.append({"n": i, "note": "x" * i})
+
+    def test_pages_cover_prefix_and_every_proof_verifies(self) -> None:
+        self.append(100)
+        seen = []
+        start = 0
+        root = None
+        while True:
+            status, body = self.call(f"/v1/proofs/inclusion?snapshot_size=100&start={start}&limit=20")
+            self.assertEqual(status, 200, body)
+            self.assertEqual(body["snapshot_size"], 100)
+            if root is None:
+                root = body["root"]
+            self.assertEqual(body["root"], root)
+            self.assertEqual(body["start"], start)
+            self.assertLessEqual(body["count"], 20)
+            indexes = [item["index"] for item in body["proofs"]]
+            self.assertEqual(indexes, list(range(start, start + body["count"])))
+            for item in body["proofs"]:
+                self.assertEqual(item["size"], 100)
+                self.assertEqual(item["root"], root)
+                self.assertTrue(verify_inclusion(item["entry_hash"], item["proof"], item["root"]))
+                seen.append(item["index"])
+            if body["next_start"] is None:
+                self.assertEqual(start + body["count"], 100)
+                break
+            self.assertEqual(body["next_start"], start + body["count"])
+            start = body["next_start"]
+        self.assertEqual(seen, list(range(100)))
+
+    def test_root_matches_prefix_smaller_than_log_and_stable_across_appends(self) -> None:
+        self.append(10)
+        _, early = self.call("/v1/proofs/inclusion?snapshot_size=7&start=0&limit=5")
+        self.append(5)  # log is now 15; the size-7 snapshot must be unchanged
+        self.assertEqual(self.log.size(), 15)
+        _, later = self.call("/v1/proofs/inclusion?snapshot_size=7&start=5&limit=10")
+        self.assertEqual(early["root"], later["root"])
+        self.assertEqual(later["start"], 5)
+        self.assertEqual(later["count"], 2)
+        self.assertIsNone(later["next_start"])
+        for item in later["proofs"]:
+            self.assertTrue(verify_inclusion(item["entry_hash"], item["proof"], later["root"]))
+
+    def test_snapshot_root_equals_merkle_root_of_prefix(self) -> None:
+        self.append(6)
+        with self.log._lock:
+            prefix = [e.hash for e in self.log._entries[:4]]
+        _, body = self.call("/v1/proofs/inclusion?snapshot_size=4&start=0&limit=100")
+        self.assertEqual(body["root"], merkle_root(prefix))
+        self.assertEqual(body["count"], 4)
+        self.assertIsNone(body["next_start"])
+
+    def test_start_at_snapshot_size_returns_empty_page(self) -> None:
+        self.append(3)
+        status, body = self.call("/v1/proofs/inclusion?snapshot_size=3&start=3&limit=20")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["count"], 0)
+        self.assertEqual(body["proofs"], [])
+        self.assertIsNone(body["next_start"])
+
+    def test_empty_log_snapshot_zero_is_an_empty_page(self) -> None:
+        status, body = self.call("/v1/proofs/inclusion?snapshot_size=0&start=0&limit=20")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["root"], "0" * 64)
+        self.assertEqual(body["count"], 0)
+        self.assertEqual(body["proofs"], [])
+        self.assertIsNone(body["next_start"])
+
+    def test_concurrent_appends_do_not_change_existing_snapshot(self) -> None:
+        self.append(20)
+        _, before = self.call("/v1/proofs/inclusion?snapshot_size=20&start=0&limit=100")
+
+        def append_more() -> None:
+            for _ in range(200):
+                self.log.append({"k": "v" * 3})
+
+        threads = [threading.Thread(target=append_more) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        _, during = self.call("/v1/proofs/inclusion?snapshot_size=20&start=0&limit=100")
+        for thread in threads:
+            thread.join()
+        _, after = self.call("/v1/proofs/inclusion?snapshot_size=20&start=0&limit=100")
+        self.assertEqual(during["root"], before["root"])
+        self.assertEqual(after["root"], before["root"])
+        self.assertEqual([p["entry_hash"] for p in after["proofs"]],
+                         [p["entry_hash"] for p in before["proofs"]])
+
+    def test_invalid_inputs(self) -> None:
+        self.append(5)
+        bad_paths = [
+            "/v1/proofs/inclusion",
+            "/v1/proofs/inclusion?start=0&limit=20",
+            "/v1/proofs/inclusion?snapshot_size=5&start=0",
+            "/v1/proofs/inclusion?snapshot_size=5&start=0&limit=20&extra=1",
+            "/v1/proofs/inclusion?snapshot_size=5&snapshot_size=5&start=0&limit=20",
+            "/v1/proofs/inclusion?snapshot_size=5&start=0&start=1&limit=20",
+            "/v1/proofs/inclusion?snapshot_size=5&start=0&limit=20&limit=30",
+            "/v1/proofs/inclusion?snapshot_size=6&start=0&limit=20",      # log too short
+            "/v1/proofs/inclusion?snapshot_size=5&start=6&limit=20",      # start beyond snapshot
+            "/v1/proofs/inclusion?snapshot_size=5&start=0&limit=0",       # below range
+            "/v1/proofs/inclusion?snapshot_size=5&start=0&limit=101",     # above range
+            "/v1/proofs/inclusion?snapshot_size=-1&start=0&limit=20",     # sign
+            "/v1/proofs/inclusion?snapshot_size=5&start=-0&limit=20",
+            "/v1/proofs/inclusion?snapshot_size=5&start=0&limit=+20",
+            "/v1/proofs/inclusion?snapshot_size=5.0&start=0&limit=20",    # fraction
+            "/v1/proofs/inclusion?snapshot_size=5&start=0&limit=2e1",     # exponent
+            "/v1/proofs/inclusion?snapshot_size=%205&start=0&limit=20",   # whitespace
+            "/v1/proofs/inclusion?snapshot_size=5&start=0%20&limit=20",
+            "/v1/proofs/inclusion?snapshot_size=0x5&start=0&limit=20",    # non-decimal
+            "/v1/proofs/inclusion?snapshot_size=5&start=abc&limit=20",
+            "/v1/proofs/inclusion?snapshot_size=5&start=0&limit=",        # empty value
+        ]
+        for path in bad_paths:
+            status, body = self.call(path)
+            self.assertEqual(status, 400, path)
+            self.assertEqual(body["error"]["code"], "invalid_request", path)
+
+    def test_unknown_route_still_404(self) -> None:
+        self.assertEqual(self.call("/v1/proofs/inclusion/")[0], 404)
+
+
 if __name__ == "__main__":
     unittest.main()
