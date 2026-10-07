@@ -1,7 +1,8 @@
 """Verifiable audit log: the baseline service.
 
 Public contract is README.md. Entries are chained (each entry commits to the previous entry hash) and the
-log publishes a Merkle root with inclusion proofs so a third party can verify a single entry offline.
+log publishes a Merkle root with inclusion proofs so a third party can verify a single entry offline, plus
+consistency proofs so a third party can verify that one log size extends another.
 """
 from __future__ import annotations
 
@@ -80,6 +81,117 @@ def verify_inclusion(entry_hash: str, proof: list[dict[str, str]], root: str) ->
     return current == root
 
 
+# --- Consistency proofs -----------------------------------------------------
+#
+# The duplicate-last tree satisfies, for every n >= 2 and with k the largest
+# power of two below n (j = log2(k)):
+#
+#     merkle_root(L[:n]) == node_hash(merkle_root(L[:k]),
+#                                     raise(merkle_root(L[k:n]), j - depth(n - k)))
+#
+# where depth(s) = ceil(log2(s)) and raise(h, t) folds h with itself t times
+# (the forced duplication a short right subtree undergoes while the perfect
+# left subtree finishes its levels).  Both the prover and the verifier below
+# are built on that identity, so a proof is a single bottom-to-top list of
+# {position, hash} nodes from which both the old and the new root recompute.
+
+def _tree_split(n: int) -> tuple[int, int]:
+    """Split of a size-n tree (n >= 2) into (left_size, left_depth); left_size is a power of two."""
+    j = (n - 1).bit_length() - 1
+    return 1 << j, j
+
+
+def _tree_depth(n: int) -> int:
+    """Levels a size-n tree (n >= 1) needs to reach its root."""
+    return (n - 1).bit_length()
+
+
+def _raise(hash_hex: str, levels: int) -> str:
+    for _ in range(levels):
+        hash_hex = node_hash(hash_hex, hash_hex)
+    return hash_hex
+
+
+def _forced_root(leaves: list[str], depth: int) -> str:
+    """Root of `leaves` raised (by self-pairing) until its depth equals `depth`."""
+    return _raise(merkle_root(leaves), depth - _tree_depth(len(leaves)))
+
+
+def _consistency_nodes(leaves: list[str], m: int, n: int) -> list[dict[str, str]]:
+    """Nodes proving merkle_root(leaves[:m]) is a prefix of merkle_root(leaves[:n]); n == len(leaves)."""
+    if m == n or m == 0:
+        # Subtree entirely inside the old prefix (or old prefix empty): emit the subroot itself.
+        return [{"position": "right", "hash": merkle_root(leaves)}]
+    k, j = _tree_split(n)
+    if m <= k:
+        return _consistency_nodes(leaves[:k], m, k) + [{"position": "right", "hash": _forced_root(leaves[k:], j)}]
+    return _consistency_nodes(leaves[k:], m - k, n - k) + [{"position": "left", "hash": merkle_root(leaves[:k])}]
+
+
+def consistency_proof(leaves: list[str], old_size: int, new_size: int) -> list[dict[str, str]]:
+    """Proof that the first `old_size` leaves are a prefix of the first `new_size` ones (bottom-to-top)."""
+    if not 0 <= old_size <= new_size <= len(leaves):
+        raise InvalidRequest("require 0 <= old_size <= new_size <= len(leaves)")
+    if old_size == new_size:
+        return []
+    return _consistency_nodes(leaves[:new_size], old_size, new_size)
+
+
+def _is_hash64(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _verify_consistency_nodes(m: int, n: int, proof: list[dict[str, str]], i: int) -> tuple[str, str, int]:
+    """Recompute (old_subroot, new_subroot, next_proof_index) for a size-n tree with prefix m."""
+    if m == n or m == 0:
+        node = proof[i]
+        if node["position"] != "right":
+            raise ValueError("subroot node must be positioned right")
+        return (node["hash"], node["hash"], i + 1) if m == n else (ZERO, node["hash"], i + 1)
+    k, j = _tree_split(n)
+    if m <= k:
+        old, new, i = _verify_consistency_nodes(m, k, proof, i)
+        node = proof[i]
+        if node["position"] != "right":
+            raise ValueError("right sibling must be positioned right")
+        return old, node_hash(new, node["hash"]), i + 1
+    old, new, i = _verify_consistency_nodes(m - k, n - k, proof, i)
+    old = _raise(old, j - _tree_depth(m - k))
+    new = _raise(new, j - _tree_depth(n - k))
+    node = proof[i]
+    if node["position"] != "left":
+        raise ValueError("left sibling must be positioned left")
+    return node_hash(node["hash"], old), node_hash(node["hash"], new), i + 1
+
+
+def verify_consistency(old_size: Any, new_size: Any, old_root: Any, new_root: Any, proof: Any) -> bool:
+    """Offline check of a consistency proof: True iff `proof` shows the size-`old_size` log with
+    `old_root` is a prefix of the size-`new_size` log with `new_root`.  Never raises."""
+    if (not isinstance(old_size, int) or isinstance(old_size, bool) or old_size < 0
+            or not isinstance(new_size, int) or isinstance(new_size, bool) or new_size < 0
+            or old_size > new_size):
+        return False
+    if not _is_hash64(old_root) or not _is_hash64(new_root):
+        return False
+    if old_size == 0 and old_root != ZERO:
+        return False
+    if new_size == 0 and new_root != ZERO:
+        return False
+    if not isinstance(proof, list):
+        return False
+    for node in proof:
+        if (not isinstance(node, dict) or set(node) != {"position", "hash"}
+                or node["position"] not in {"left", "right"} or not _is_hash64(node["hash"])):
+            return False
+    if old_size == new_size:
+        return proof == [] and old_root == new_root
+    try:
+        old, new, used = _verify_consistency_nodes(old_size, new_size, proof, 0)
+    except (IndexError, TypeError, KeyError, ValueError):
+        return False
+    return used == len(proof) and old == old_root and new == new_root
+
+
 @dataclass(frozen=True)
 class Entry:
     index: int
@@ -121,6 +233,25 @@ def parse_proofs_query(query: str) -> tuple[int, int, int]:
     return (_decimal_int(values["snapshot_size"], "snapshot_size"),
             _decimal_int(values["start"], "start"),
             _decimal_int(values["limit"], "limit"))
+
+
+def parse_consistency_query(query: str) -> tuple[int, int]:
+    """Parse the consistency query string: exactly one `from` and one `to`, nothing else."""
+    if not query:
+        raise InvalidRequest("from and to are required")
+    values: dict[str, str] = {}
+    for pair in query.split("&"):
+        if not pair or "=" not in pair:
+            raise InvalidRequest("malformed query string")
+        key, value = pair.split("=", 1)
+        if key not in {"from", "to"}:
+            raise InvalidRequest(f"unknown query parameter: {key}")
+        if key in values:
+            raise InvalidRequest(f"query parameter {key} must appear exactly once")
+        values[key] = value
+    if {"from", "to"} - values.keys():
+        raise InvalidRequest("from and to are required")
+    return _decimal_int(values["from"], "from"), _decimal_int(values["to"], "to")
 
 
 class AuditLog:
@@ -192,6 +323,26 @@ class AuditLog:
             return {"snapshot_size": snapshot_size, "root": root, "start": start, "count": count,
                     "next_start": cursor if cursor < snapshot_size else None, "proofs": proofs}
 
+    def consistency(self, old_size: Any, new_size: Any) -> dict[str, Any]:
+        """Consistency proof between two prefix sizes of this log.
+
+        Old/new roots and the proof are computed under a single lock acquisition, so the pair
+        always belongs to one snapshot even while concurrent appends enlarge the log.
+        """
+        if not all(isinstance(value, int) and not isinstance(value, bool) for value in (old_size, new_size)):
+            raise InvalidRequest("from and to must be integers")
+        if old_size < 0 or new_size < 0:
+            raise InvalidRequest("from and to must be non-negative integers")
+        if old_size > new_size:
+            raise InvalidRequest("from must not exceed to")
+        with self._lock:
+            if new_size > len(self._entries):
+                raise InvalidRequest(f"log has fewer than {new_size} entries")
+            leaves = [entry.hash for entry in self._entries[:new_size]]
+            return {"from": old_size, "to": new_size,
+                    "old_root": merkle_root(leaves[:old_size]), "new_root": merkle_root(leaves),
+                    "proof": consistency_proof(leaves, old_size, new_size)}
+
     def size(self) -> int:
         with self._lock:
             return len(self._entries)
@@ -244,6 +395,9 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, log.entry(int(parts[2]) if parts[2].isdigit() else parts[2]).as_json())
                 if len(parts) == 4 and parts[:3] == ["v1", "proof", "inclusion"]:
                     return self._send(200, log.proof(int(parts[3]) if parts[3].isdigit() else parts[3]))
+                if self.path.split("?", 1)[0] == "/v1/proof/consistency":
+                    old_size, new_size = parse_consistency_query(self.path.split("?", 1)[1] if "?" in self.path else "")
+                    return self._send(200, log.consistency(old_size, new_size))
                 if self.path.split("?", 1)[0] == "/v1/proofs/inclusion":
                     snapshot_size, start, limit = parse_proofs_query(self.path.split("?", 1)[1] if "?" in self.path else "")
                     return self._send(200, log.proofs_page(snapshot_size, start, limit))

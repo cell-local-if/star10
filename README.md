@@ -55,6 +55,17 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 ### `GET /v1/root`
 `200 {"root": <hex>, "size": <int>}`
 
+### `GET /v1/proof/consistency?from=<m>&to=<n>`
+两个日志大小之间的 **Merkle 一致性证明**：确认大小为 `m` 的旧前缀仍是大小为 `n` 的新根下的同一段前缀。
+- `from`、`to` 各出现一次，为非负十进制整数；不得有空白、正负号、小数、指数、非十进制字符、
+  重复参数或未知参数，否则 `400 invalid_request`。`from > to` 或 `to` 超过当前条目数亦为 `400`。
+- `200`：`{"from": <int>, "to": <int>, "old_root": <hex>, "new_root": <hex>, "proof": [{"position","hash"}, ...]}`；
+  `from == to` 时 `proof` 为空且 `old_root == new_root`；`proof` 节点按**从底到顶**排列，
+  `position` 为 `left|right`，`hash` 为 64 位十六进制。根与证明在一次锁定读取中确定，后续追加不改变已返回的结果。
+- 离线校验：`verify_consistency(old_size, new_size, old_root, new_root, proof) -> bool`，
+  纯函数，只依赖 `leaf_hash`/`node_hash`/`merkle_root` 与上述字段；非法输入（尺寸、长度或十六进制格式错误、
+  节点被替换、顺序颠倒等）一律返回 `False`，不抛异常。
+
 ## 错误语义
 
 ```json
@@ -63,5 +74,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 
 ## 未实现（后续任务候选，非固定题单）
 
-一致性证明（两个大小之间）、封存与外部锚定、证据导出与离线校验器、签名与密钥轮换、保留策略与裁剪、
+封存与外部锚定、证据导出与离线校验器、签名与密钥轮换、保留策略与裁剪、
 并发追加下的树一致性、与外部时间源绑定、失败注入与审计。

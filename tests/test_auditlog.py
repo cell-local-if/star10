@@ -7,7 +7,8 @@ import unittest
 import urllib.error
 import urllib.request
 
-from auditlog import AuditLog, EntryNotFound, InvalidRequest, inclusion_proof, merkle_root, verify_inclusion
+from auditlog import (AuditLog, EntryNotFound, InvalidRequest, inclusion_proof, merkle_root,
+                      verify_consistency, verify_inclusion)
 
 
 class MerkleUnitTests(unittest.TestCase):
@@ -256,6 +257,151 @@ class PagedProofsTests(unittest.TestCase):
 
     def test_unknown_route_still_404(self) -> None:
         self.assertEqual(self.call("/v1/proofs/inclusion/")[0], 404)
+
+
+class ConsistencyProofTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from auditlog import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.log = cls.server.log
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        with self.log._lock:
+            self.log._entries.clear()
+
+    def call(self, path: str):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def append(self, n: int) -> None:
+        for i in range(n):
+            self.log.append({"n": i, "note": "x" * i})
+
+    def test_every_pair_of_sizes_verifies_offline(self) -> None:
+        self.append(40)
+        with self.log._lock:
+            leaves = [e.hash for e in self.log._entries]
+        roots = [merkle_root(leaves[:n]) for n in range(41)]
+        for new_size in range(41):
+            for old_size in range(new_size + 1):
+                status, body = self.call(f"/v1/proof/consistency?from={old_size}&to={new_size}")
+                self.assertEqual(status, 200, (old_size, new_size, body))
+                self.assertEqual((body["from"], body["to"]), (old_size, new_size))
+                self.assertEqual(body["old_root"], roots[old_size])
+                self.assertEqual(body["new_root"], roots[new_size])
+                self.assertTrue(
+                    verify_consistency(old_size, new_size, body["old_root"], body["new_root"], body["proof"]),
+                    (old_size, new_size))
+                for node in body["proof"]:
+                    self.assertIn(node["position"], ("left", "right"))
+                    self.assertEqual(len(node["hash"]), 64)
+                    int(node["hash"], 16)
+
+    def test_equal_sizes_return_empty_proof_and_same_root(self) -> None:
+        self.append(5)
+        status, body = self.call("/v1/proof/consistency?from=5&to=5")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["proof"], [])
+        self.assertEqual(body["old_root"], body["new_root"])
+        self.assertTrue(verify_consistency(5, 5, body["old_root"], body["new_root"], []))
+
+    def test_zero_sizes_and_empty_log(self) -> None:
+        status, body = self.call("/v1/proof/consistency?from=0&to=0")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["proof"], [])
+        self.assertEqual(body["old_root"], "0" * 64)
+        self.assertEqual(body["new_root"], "0" * 64)
+        self.assertTrue(verify_consistency(0, 0, body["old_root"], body["new_root"], body["proof"]))
+        self.append(3)
+        status, body = self.call("/v1/proof/consistency?from=0&to=3")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["old_root"], "0" * 64)
+        self.assertTrue(verify_consistency(0, 3, body["old_root"], body["new_root"], body["proof"]))
+
+    def test_proof_is_stable_across_later_appends(self) -> None:
+        self.append(6)
+        _, before = self.call("/v1/proof/consistency?from=3&to=6")
+        self.append(10)
+        _, after = self.call("/v1/proof/consistency?from=3&to=6")
+        self.assertEqual(before, after)
+
+    def test_tampered_proof_is_rejected(self) -> None:
+        self.append(9)
+        _, body = self.call("/v1/proof/consistency?from=5&to=9")
+        args = (5, 9, body["old_root"], body["new_root"])
+        self.assertFalse(verify_consistency(*args, proof=[]))
+        self.assertFalse(verify_consistency(5, 9, "a" * 64, body["new_root"], body["proof"]))
+        self.assertFalse(verify_consistency(5, 9, body["old_root"], "b" * 64, body["proof"]))
+        broken = [dict(node) for node in body["proof"]]
+        broken[0]["hash"] = "e" * 64
+        self.assertFalse(verify_consistency(*args, proof=broken))
+        flipped = [dict(node) for node in body["proof"]]
+        flipped[0]["position"] = "left" if flipped[0]["position"] == "right" else "right"
+        self.assertFalse(verify_consistency(*args, proof=flipped))
+        if len(body["proof"]) > 1:
+            self.assertFalse(verify_consistency(*args, proof=list(reversed(body["proof"]))))
+        self.assertFalse(verify_consistency(*args, proof=body["proof"][:-1]))
+        self.assertFalse(verify_consistency(*args, proof=body["proof"] + [{"position": "right", "hash": "c" * 64}]))
+
+    def test_malformed_verify_inputs_return_false_not_raise(self) -> None:
+        zero = "0" * 64
+        bad = [
+            (-1, 2, zero, zero, []), (2, 1, zero, zero, []), (True, 2, zero, zero, []),
+            (0.5, 2, zero, zero, []), ("1", 2, zero, zero, []), (0, 0, "1" * 64, "1" * 64, []),
+            (0, 1, zero, "g" * 64, []), (0, 1, zero, "a" * 63, []), (0, 1, zero, "a" * 65, []),
+            (0, 1, zero, zero, None), (0, 1, zero, zero, "x"),
+            (0, 2, zero, zero, [{"position": "up", "hash": zero}]),
+            (0, 2, zero, zero, [{"position": "left", "hash": "zz"}]),
+            (0, 2, zero, zero, [{"position": "left", "hash": zero, "extra": 1}]),
+            (0, 2, zero, zero, [{"position": "left"}]),
+            (0, 2, zero, zero, [None]),
+            (3, 3, zero, zero, [{"position": "right", "hash": zero}]),
+        ]
+        for args in bad:
+            self.assertIs(verify_consistency(*args), False, args)
+
+    def test_invalid_queries(self) -> None:
+        self.append(5)
+        bad_paths = [
+            "/v1/proof/consistency",
+            "/v1/proof/consistency?from=1",
+            "/v1/proof/consistency?to=1",
+            "/v1/proof/consistency?from=1&to=2&extra=1",
+            "/v1/proof/consistency?from=1&from=1&to=2",
+            "/v1/proof/consistency?from=1&to=2&to=3",
+            "/v1/proof/consistency?from=&to=2",
+            "/v1/proof/consistency?from=1&to=",
+            "/v1/proof/consistency?from=-1&to=2",
+            "/v1/proof/consistency?from=+1&to=2",
+            "/v1/proof/consistency?from=1.0&to=2",
+            "/v1/proof/consistency?from=1e1&to=20",
+            "/v1/proof/consistency?from=%201&to=2",
+            "/v1/proof/consistency?from=1%20&to=2",
+            "/v1/proof/consistency?from=0x1&to=2",
+            "/v1/proof/consistency?from=abc&to=2",
+            "/v1/proof/consistency?from=3&to=2",     # from > to
+            "/v1/proof/consistency?from=0&to=6",     # beyond log size
+            "/v1/proof/consistency?from=0&to=99",
+        ]
+        for path in bad_paths:
+            status, body = self.call(path)
+            self.assertEqual(status, 400, path)
+            self.assertEqual(body["error"]["code"], "invalid_request", path)
+
+    def test_unknown_route_still_404(self) -> None:
+        self.assertEqual(self.call("/v1/proof/consistency/")[0], 404)
+        self.assertEqual(self.call("/v1/proof/unknown?from=0&to=1")[0], 404)
 
 
 if __name__ == "__main__":
