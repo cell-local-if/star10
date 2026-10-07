@@ -7,7 +7,8 @@ import unittest
 import urllib.error
 import urllib.request
 
-from auditlog import AuditLog, EntryNotFound, InvalidRequest, inclusion_proof, merkle_root, verify_inclusion
+from auditlog import (AuditLog, EntryNotFound, InvalidRequest, consistency_proof, inclusion_proof,
+                      merkle_root, verify_consistency, verify_inclusion)
 
 
 class MerkleUnitTests(unittest.TestCase):
@@ -256,6 +257,203 @@ class PagedProofsTests(unittest.TestCase):
 
     def test_unknown_route_still_404(self) -> None:
         self.assertEqual(self.call("/v1/proofs/inclusion/")[0], 404)
+
+
+class ConsistencyUnitTests(unittest.TestCase):
+    @staticmethod
+    def leaves(n: int) -> list[str]:
+        from auditlog import sha256_hex
+        return [sha256_hex(b"leaf", str(i).encode()) for i in range(n)]
+
+    def test_exhaustive_prefixes_verify(self) -> None:
+        leaves = self.leaves(130)
+        for n in range(0, len(leaves) + 1):
+            new_root = merkle_root(leaves[:n])
+            for m in range(0, n + 1):
+                old_root = merkle_root(leaves[:m])
+                proof = consistency_proof(leaves, m, n)
+                self.assertTrue(verify_consistency(m, n, old_root, new_root, proof), f"{m}->{n}")
+                for step in proof:
+                    self.assertEqual(set(step), {"position", "hash"})
+                    self.assertIn(step["position"], {"left", "right"})
+                    int(step["hash"], 16)
+                    self.assertEqual(len(step["hash"]), 64)
+
+    def test_equal_sizes_and_zero_are_empty_proofs(self) -> None:
+        leaves = self.leaves(6)
+        root = merkle_root(leaves)
+        zero = "0" * 64
+        self.assertEqual(consistency_proof(leaves, 4, 4), [])
+        self.assertTrue(verify_consistency(4, 4, root, root, []))
+        self.assertTrue(verify_consistency(0, 0, zero, zero, []))
+        self.assertTrue(verify_consistency(0, 6, zero, root, []))
+        self.assertEqual(consistency_proof(leaves, 0, 6), [])
+
+    def test_tampered_order_and_length_rejected(self) -> None:
+        leaves = self.leaves(11)
+        for m, n in [(1, 2), (2, 3), (3, 7), (5, 9), (7, 8), (8, 11), (1, 11), (10, 11)]:
+            old_root, new_root = merkle_root(leaves[:m]), merkle_root(leaves[:n])
+            proof = consistency_proof(leaves, m, n)
+            self.assertTrue(verify_consistency(m, n, old_root, new_root, proof), f"{m}->{n}")
+            self.assertFalse(verify_consistency(m, n, old_root, "f" * 64, proof), f"{m}->{n} bad new root")
+            self.assertFalse(verify_consistency(m, n, "f" * 64, new_root, proof), f"{m}->{n} bad old root")
+            for k in range(len(proof)):
+                broken = [dict(step) for step in proof]
+                broken[k]["hash"] = f"{k:064d}"
+                self.assertFalse(verify_consistency(m, n, old_root, new_root, broken), f"{m}->{n} tamper {k}")
+                swapped = [dict(step) for step in proof]
+                swapped[k]["position"] = "left" if swapped[k]["position"] == "right" else "right"
+                self.assertFalse(verify_consistency(m, n, old_root, new_root, swapped), f"{m}->{n} swap {k}")
+            if proof:
+                self.assertFalse(verify_consistency(m, n, old_root, new_root, list(reversed(proof))))
+                self.assertFalse(verify_consistency(m, n, old_root, new_root, proof[:-1]))
+                self.assertFalse(
+                    verify_consistency(m, n, old_root, new_root, proof + [{"position": "left", "hash": "1" * 64}]))
+
+    def test_shape_is_bound_to_sizes(self) -> None:
+        leaves = self.leaves(20)
+        # Replaying the 1->3 proof under a size-4 label only rebuilds the size-3 root, so it must
+        # not match the authentic signed STH at size 4; a 2->3 label has a different node shape.
+        p13 = consistency_proof(leaves, 1, 3)
+        self.assertFalse(verify_consistency(1, 4, merkle_root(leaves[:1]), merkle_root(leaves[:4]), p13))
+        self.assertFalse(verify_consistency(2, 3, merkle_root(leaves[:2]), merkle_root(leaves[:3]), p13))
+
+    def test_malformed_inputs_return_false_never_raise(self) -> None:
+        leaves = self.leaves(6)
+        root2, root6 = merkle_root(leaves[:2]), merkle_root(leaves)
+        good = consistency_proof(leaves, 2, 6)
+        cases = [
+            ("neg", lambda: verify_consistency(-1, 6, root2, root6, good)),
+            ("m>n", lambda: verify_consistency(6, 2, root6, root2, good)),
+            ("bool", lambda: verify_consistency(True, 6, root2, root6, good)),
+            ("float", lambda: verify_consistency(2.0, 6, root2, root6, good)),
+            ("root types", lambda: verify_consistency(2, 6, None, root6, good)),
+            ("upper hex", lambda: verify_consistency(2, 6, root2, "A" * 64, good)),
+            ("proof str", lambda: verify_consistency(2, 6, root2, root6, "x")),
+            ("bad hex", lambda: verify_consistency(2, 6, root2, root6, [{"position": "left", "hash": "z" * 64}])),
+            ("bad pos", lambda: verify_consistency(2, 6, root2, root6, [{"position": "up", "hash": "1" * 64}])),
+            ("extra key", lambda: verify_consistency(2, 6, root2, root6,
+                                                     [{"position": "left", "hash": "1" * 64, "x": 1}])),
+            ("node not dict", lambda: verify_consistency(2, 6, root2, root6, ["x"])),
+            ("m=n nonempty", lambda: verify_consistency(6, 6, root6, root6, good)),
+            ("m=n diff root", lambda: verify_consistency(6, 6, root6, "1" * 64, [])),
+            ("m=0 nonempty", lambda: verify_consistency(0, 6, "0" * 64, root6, good)),
+            ("m=0 bad old", lambda: verify_consistency(0, 6, "1" * 64, root6, [])),
+        ]
+        for name, check in cases:
+            self.assertFalse(check(), name)
+
+    def test_generator_validates_ranges(self) -> None:
+        leaves = self.leaves(4)
+        with self.assertRaises(InvalidRequest):
+            consistency_proof(leaves, 2, 5)     # beyond available leaves
+        with self.assertRaises(InvalidRequest):
+            consistency_proof(leaves, 3, 2)
+        with self.assertRaises(InvalidRequest):
+            consistency_proof(leaves, -1, 2)
+        with self.assertRaises(InvalidRequest):
+            consistency_proof(leaves, True, 2)  # type: ignore[arg-type]
+
+
+class ConsistencyHttpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from auditlog import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.log = cls.server.log
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        with self.log._lock:
+            self.log._entries.clear()
+
+    def call(self, path: str):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def append(self, n: int) -> None:
+        for i in range(n):
+            self.log.append({"n": i, "note": "x" * i})
+
+    def test_consistency_end_to_end_for_every_prefix(self) -> None:
+        self.append(33)
+        with self.log._lock:
+            leaves = [e.hash for e in self.log._entries]
+        for m in range(0, 34):
+            for n in range(m, 34):
+                status, body = self.call(f"/v1/proof/consistency?from={m}&to={n}")
+                self.assertEqual(status, 200, body)
+                self.assertEqual((body["from"], body["to"]), (m, n))
+                self.assertEqual(body["old_root"], merkle_root(leaves[:m]))
+                self.assertEqual(body["new_root"], merkle_root(leaves[:n]))
+                self.assertTrue(
+                    verify_consistency(m, n, body["old_root"], body["new_root"], body["proof"]),
+                    f"{m}->{n}")
+
+    def test_empty_log_and_equal_sizes(self) -> None:
+        status, body = self.call("/v1/proof/consistency?from=0&to=0")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"from": 0, "to": 0, "old_root": "0" * 64,
+                                "new_root": "0" * 64, "proof": []})
+        self.append(4)
+        status, body = self.call("/v1/proof/consistency?from=3&to=3")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["old_root"], body["new_root"])
+        self.assertEqual(body["proof"], [])
+        status, body = self.call("/v1/proof/consistency?from=0&to=4")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["old_root"], "0" * 64)
+        self.assertEqual(body["proof"], [])
+
+    def test_snapshot_stable_across_appends(self) -> None:
+        self.append(7)
+        _, before = self.call("/v1/proof/consistency?from=3&to=7")
+        self.append(9)
+        _, after = self.call("/v1/proof/consistency?from=3&to=7")
+        self.assertEqual(before, after)
+        _, grown = self.call("/v1/proof/consistency?from=7&to=16")
+        self.assertTrue(verify_consistency(7, 16, before["new_root"], grown["new_root"], grown["proof"]))
+
+    def test_strict_query_parsing_and_ranges(self) -> None:
+        self.append(5)
+        bad_paths = [
+            "/v1/proof/consistency",
+            "/v1/proof/consistency?from=1",
+            "/v1/proof/consistency?to=3",
+            "/v1/proof/consistency?from=1&to=3&extra=1",
+            "/v1/proof/consistency?from=1&from=2&to=3",
+            "/v1/proof/consistency?from=1&to=3&to=4",
+            "/v1/proof/consistency?from=-1&to=3",
+            "/v1/proof/consistency?from=1&to=+3",
+            "/v1/proof/consistency?from=1.0&to=3",
+            "/v1/proof/consistency?from=1e0&to=3",
+            "/v1/proof/consistency?from=%201&to=3",
+            "/v1/proof/consistency?from=0x1&to=3",
+            "/v1/proof/consistency?from=&to=3",
+            "/v1/proof/consistency?from=1&to=",
+            "/v1/proof/consistency?from=abc&to=3",
+            "/v1/proof/consistency?from=6&to=6",       # to beyond current size
+            "/v1/proof/consistency?from=4&to=6",
+            "/v1/proof/consistency?from=5&to=3",       # from > to
+        ]
+        for path in bad_paths:
+            status, body = self.call(path)
+            self.assertEqual(status, 400, path)
+            self.assertEqual(body["error"]["code"], "invalid_request", path)
+
+    def test_unknown_routes_unchanged(self) -> None:
+        for path in ["/v1/proof/consistency/", "/v1/proof/consistency/1", "/v1/proof",
+                     "/v1/proofs/consistency?from=0&to=1", "/nope"]:
+            self.assertEqual(self.call(path)[0], 404, path)
 
 
 if __name__ == "__main__":

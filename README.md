@@ -52,6 +52,22 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
   `start == snapshot_size` 时允许 `count` 为 0、`proofs` 为空。同一 `snapshot_size` 的不同页根相同，
   调用方可用返回的 `root` 直接经 `verify_inclusion` 离线校验每项。
 
+### `GET /v1/proof/consistency?from=<m>&to=<n>`
+确认同一日志的旧前缀大小 `m` 扩展到新前缀大小 `n` 时，旧根仍是新根下的**同一段前缀**（同一棵奇数层复制末节点的树）。
+- `from`、`to` 各出现一次，均为非负十进制整数；不得有空白、正负号、小数、指数、非十进制字符、空值、
+  重复参数或未知参数，否则 `400 invalid_request`。
+- `0 <= from <= to <= 当前条目数`；越界或 `from > to` 均为 `400`。
+- `200`：
+```json
+{"from": <int>, "to": <int>, "old_root": <hex>, "new_root": <hex>,
+ "proof": [{"position":"left|right","hash":<hex>}, ...]}
+```
+  `proof` 节点按**从底到顶**排列；`from == to` 时 `proof` 为空且 `old_root == new_root`；
+  `from == 0` 时 `proof` 为空、`old_root` 为 64 个零（空日志是任意日志的前缀）。
+  公开纯函数 `verify_consistency(old_size, new_size, old_root, new_root, proof)` 可离线复核：
+  合法路径（含 `m=0`、`m=n`、奇数叶子数）返回 `True`；任意节点被替换、顺序颠倒、长度或位置序列不符、
+  十六进制格式错误或大小非法一律返回 `False`，不抛异常。
+
 ### `GET /v1/root`
 `200 {"root": <hex>, "size": <int>}`
 
@@ -63,5 +79,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 
 ## 未实现（后续任务候选，非固定题单）
 
-一致性证明（两个大小之间）、封存与外部锚定、证据导出与离线校验器、签名与密钥轮换、保留策略与裁剪、
+封存与外部锚定、证据导出与离线校验器、签名与密钥轮换、保留策略与裁剪、
 并发追加下的树一致性、与外部时间源绑定、失败注入与审计。
