@@ -29,6 +29,9 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 ### `POST /v1/entries`
 请求体：`{"payload": <JSON 对象或数组>}` → **`201`** `{"entry": {"index","hash","prev_hash","payload"}, "root": <hex>, "size": <int>}`。
 `payload` 缺失/为 null/是标量 ⇒ `400 invalid_request`。
+`entry`、`root`、`size` 在本次追加完成的同一次锁定读取中确定：`size == entry.index + 1`，
+`root` 为恰好包含该 entry 及其之前条目的前缀 Merkle 根；并发追加不会混入已生成的响应，
+响应一旦返回即不再变化。
 
 ### `GET /v1/entries/{index}`
 `200 {"index","hash","prev_hash","payload"}`；越界 ⇒ `404 not_found`；`index` 非非负整数 ⇒ `400`。

@@ -397,6 +397,20 @@ class AuditLog:
         self._seals: dict[str, dict[str, Any]] = {}
 
     def append(self, payload: Any) -> Entry:
+        entry, _root, _size = self._append(payload)
+        return entry
+
+    def append_with_snapshot(self, payload: Any) -> dict[str, Any]:
+        """Append and read the resulting (root, size) in the same lock acquisition as the append.
+
+        The returned entry, root and size all describe the fixed prefix ending at this entry:
+        size == entry.index + 1 and root is the Merkle root of exactly that prefix, so concurrent
+        appends can never leak into a response already composed here.
+        """
+        entry, root, size = self._append(payload)
+        return {"entry": entry.as_json(), "root": root, "size": size}
+
+    def _append(self, payload: Any) -> tuple[Entry, str, int]:
         if payload is None or (isinstance(payload, (str, bytes)) and not payload):
             raise InvalidRequest("payload is required")
         if isinstance(payload, (bytes, bytearray)) or isinstance(payload, (int, float, bool)):
@@ -407,7 +421,8 @@ class AuditLog:
             entry_hash = sha256_hex(prev.encode(), leaf_hash(payload).encode())
             entry = Entry(index, entry_hash, prev, payload)
             self._entries.append(entry)
-            return entry
+            leaves = [e.hash for e in self._entries]
+            return entry, merkle_root(leaves), len(leaves)
 
     def entry(self, index: Any) -> Entry:
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
@@ -610,8 +625,8 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json()
                 if not isinstance(body, dict) or set(body) != {"payload"}:
                     raise InvalidRequest("body must be {\"payload\": <object|array>}")
-                entry = log.append(body["payload"])
-                return self._send(201, {"entry": entry.as_json(), **log.root()})
+                entry = log.append_with_snapshot(body["payload"])
+                return self._send(201, entry)
             except AuditError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
