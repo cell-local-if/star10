@@ -397,9 +397,18 @@ class AuditLog:
         self._seals: dict[str, dict[str, Any]] = {}
 
     def append(self, payload: Any) -> Entry:
-        if payload is None or (isinstance(payload, (str, bytes)) and not payload):
-            raise InvalidRequest("payload is required")
-        if isinstance(payload, (bytes, bytearray)) or isinstance(payload, (int, float, bool)):
+        return self.append_snapshot(payload)["entry"]
+
+    def append_snapshot(self, payload: Any) -> dict[str, Any]:
+        """Append one entry and return it together with the size/root of the prefix it completed.
+
+        Only JSON objects and arrays are accepted (empty ones included); everything else is rejected
+        before taking the lock, so a failed request neither appends nor consumes an index.  The entry,
+        its chain hash, the new size and the Merkle root are all fixed under one lock acquisition: the
+        response describes exactly the prefix ending in this entry and can never absorb a concurrent
+        append that lands between writing the entry and reading the root.
+        """
+        if not isinstance(payload, (dict, list)):
             raise InvalidRequest("payload must be a JSON object or array")
         with self._lock:
             index = len(self._entries)
@@ -407,7 +416,9 @@ class AuditLog:
             entry_hash = sha256_hex(prev.encode(), leaf_hash(payload).encode())
             entry = Entry(index, entry_hash, prev, payload)
             self._entries.append(entry)
-            return entry
+            size = len(self._entries)
+            root = merkle_root([e.hash for e in self._entries])
+            return {"entry": entry, "size": size, "root": root}
 
     def entry(self, index: Any) -> Entry:
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
@@ -610,8 +621,8 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                 body = self._read_json()
                 if not isinstance(body, dict) or set(body) != {"payload"}:
                     raise InvalidRequest("body must be {\"payload\": <object|array>}")
-                entry = log.append(body["payload"])
-                return self._send(201, {"entry": entry.as_json(), **log.root()})
+                snapshot = log.append_snapshot(body["payload"])
+                return self._send(201, {**snapshot, "entry": snapshot["entry"].as_json()})
             except AuditError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
