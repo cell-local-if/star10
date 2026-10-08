@@ -7,8 +7,8 @@ import unittest
 import urllib.error
 import urllib.request
 
-from auditlog import (AuditLog, EntryNotFound, InvalidRequest, inclusion_proof, merkle_root,
-                      verify_consistency, verify_inclusion)
+from auditlog import (AuditLog, EntryNotFound, InvalidRequest, inclusion_proof, leaf_hash, merkle_root,
+                      node_hash, sha256_hex, verify_consistency, verify_entry_evidence, verify_inclusion)
 
 
 class MerkleUnitTests(unittest.TestCase):
@@ -257,6 +257,250 @@ class PagedProofsTests(unittest.TestCase):
 
     def test_unknown_route_still_404(self) -> None:
         self.assertEqual(self.call("/v1/proofs/inclusion/")[0], 404)
+
+
+class EntryEvidenceTests(unittest.TestCase):
+    """GET /v1/evidence/{index} plus the offline verify_entry_evidence checker."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from auditlog import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.log = cls.server.log
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        with self.log._lock:
+            self.log._entries.clear()
+
+    def call(self, path: str):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def append(self, n: int) -> None:
+        for i in range(n):
+            self.log.append({"n": i, "note": "x" * i})
+
+    def test_every_index_at_every_size_exports_and_verifies_offline(self) -> None:
+        for total in (1, 2, 3, 4, 5, 8, 9):
+            self.setUp()
+            self.append(total)
+            for index in range(total):
+                status, ev = self.call(f"/v1/evidence/{index}")
+                self.assertEqual(status, 200, (total, index, ev))
+                self.assertEqual(set(ev), {"entry", "size", "root", "proof"})
+                self.assertEqual(ev["size"], total)
+                self.assertEqual(set(ev["entry"]), {"index", "hash", "prev_hash", "payload"})
+                self.assertEqual(ev["entry"]["index"], index)
+                self.assertTrue(verify_entry_evidence(ev), (total, index))
+                # inclusion part is the same material the baseline proof endpoint exposes
+                self.assertTrue(verify_inclusion(ev["entry"]["hash"], ev["proof"], ev["root"]))
+                for node in ev["proof"]:
+                    self.assertEqual(set(node), {"position", "hash"})
+                    self.assertIn(node["position"], ("left", "right"))
+                    self.assertRegex(node["hash"], r"^[0-9a-f]{64}$")
+
+    def test_empty_object_and_array_payloads_verify(self) -> None:
+        for payload in ({}, []):
+            with self.log._lock:
+                self.log._entries.clear()
+            self.log.append(payload)
+            _, ev = self.call("/v1/evidence/0")
+            self.assertTrue(verify_entry_evidence(ev), payload)
+            self.assertEqual(ev["entry"]["prev_hash"], "0" * 64)
+
+    def test_first_prev_hash_is_zero_and_chain_is_consistent(self) -> None:
+        self.append(3)
+        for index in range(3):
+            _, ev = self.call(f"/v1/evidence/{index}")
+            self.assertEqual(ev["entry"]["prev_hash"],
+                             "0" * 64 if index == 0 else self.call(f"/v1/evidence/{index - 1}")[1]["entry"]["hash"])
+
+    def test_returned_evidence_remains_valid_after_later_appends(self) -> None:
+        self.append(4)
+        _, before = self.call("/v1/evidence/2")
+        self.assertEqual(before["size"], 4)
+        self.append(20)  # log grows to 24; a fresh fetch sees the bigger snapshot...
+        _, after = self.call("/v1/evidence/2")
+        self.assertEqual(after["size"], 24)
+        self.assertNotEqual(after["root"], before["root"])
+        # ...but the bundle already handed out stays self-contained and verifies forever.
+        self.assertTrue(verify_entry_evidence(before))
+        self.assertTrue(verify_entry_evidence(after))
+        self.assertEqual(before["entry"], after["entry"])
+
+    def test_index_beyond_size_is_404(self) -> None:
+        self.append(2)
+        for path in ("/v1/evidence/2", "/v1/evidence/99"):
+            status, body = self.call(path)
+            self.assertEqual(status, 404, path)
+            self.assertEqual(body["error"]["code"], "not_found", path)
+        with self.log._lock:
+            self.log._entries.clear()
+        status, body = self.call("/v1/evidence/0")  # empty log
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_malformed_index_is_400(self) -> None:
+        self.append(2)
+        for path in ("/v1/evidence/-1", "/v1/evidence/+0", "/v1/evidence/1.0", "/v1/evidence/0x1",
+                     "/v1/evidence/abc", "/v1/evidence/1%20", "/v1/evidence/%201",
+                     "/v1/evidence/1e0", "/v1/evidence/%DB%B0"):  # non-ASCII digit must not be accepted
+            status, body = self.call(path)
+            self.assertEqual(status, 400, path)
+            self.assertEqual(body["error"]["code"], "invalid_request", path)
+
+    def test_unknown_routes_still_404(self) -> None:
+        self.assertEqual(self.call("/v1/evidence")[0], 404)
+        self.assertEqual(self.call("/v1/evidence/")[0], 404)
+        self.assertEqual(self.call("/v1/evidence/1/2")[0], 404)
+        self.assertEqual(self.call("/v1/evidencex/0")[0], 404)
+        self.assertEqual(self.call("/nope")[0], 404)
+
+    # --- offline verifier: negative cases -----------------------------------
+
+    def good_evidence(self, total: int = 5, index: int = 2) -> dict:
+        self.append(total)
+        return self.call(f"/v1/evidence/{index}")[1]
+
+    def test_verifier_accepts_real_evidence_for_all_sizes(self) -> None:
+        for total in range(1, 12):
+            with self.log._lock:
+                self.log._entries.clear()
+            self.append(total)
+            for index in range(total):
+                self.assertTrue(verify_entry_evidence(self.call(f"/v1/evidence/{index}")[1]),
+                                (total, index))
+
+    def test_verifier_rejects_non_dict_and_wrong_top_level_shape(self) -> None:
+        ev = self.good_evidence()
+        for bad in (None, 1, "x", [], json.dumps(ev)):
+            self.assertIs(verify_entry_evidence(bad), False, bad)
+        for key in ("entry", "size", "root", "proof"):
+            broken = dict(ev)
+            del broken[key]
+            self.assertIs(verify_entry_evidence(broken), False, key)
+        self.assertIs(verify_entry_evidence({**ev, "extra": 1}), False)
+
+    def test_verifier_rejects_bad_size_and_index(self) -> None:
+        ev = self.good_evidence()
+        for size in (-1, 0, ev["size"] - 1, "5", 5.0, True, None):
+            self.assertIs(verify_entry_evidence({**ev, "size": size}), False, size)
+        bad_entry = dict(ev["entry"])
+        for index in (-1, ev["size"], ev["size"] + 1, "2", 2.0, True, None):
+            bad_entry["index"] = index
+            self.assertIs(verify_entry_evidence({**ev, "entry": bad_entry}), False, index)
+
+    def test_verifier_rejects_bad_hashes(self) -> None:
+        ev = self.good_evidence()
+        for field in ("hash", "prev_hash"):
+            for value in ("a" * 63, "A" * 64, "g" * 64, None, 123, b"a" * 64):
+                entry = dict(ev["entry"])
+                entry[field] = value
+                self.assertIs(verify_entry_evidence({**ev, "entry": entry}), False, (field, value))
+        for value in ("a" * 63, "A" * 64, "g" * 64, None, 123):
+            self.assertIs(verify_entry_evidence({**ev, "root": value}), False, value)
+
+    def test_verifier_rejects_bad_payloads(self) -> None:
+        ev = self.good_evidence(index=0)
+        for payload in (None, "str", 1, 1.5, True, b"x", (), set(), {"ok": object()}, [object()]):
+            entry = dict(ev["entry"])
+            entry["payload"] = payload
+            self.assertIs(verify_entry_evidence({**ev, "entry": entry}), False, payload)
+        # dict with a non-string key can't come from JSON but must still be rejected safely
+        entry = dict(ev["entry"])
+        entry["payload"] = {1: 2}
+        self.assertIs(verify_entry_evidence({**ev, "entry": entry}), False)
+
+    def test_first_entry_requires_zero_prev_hash(self) -> None:
+        ev = self.good_evidence(total=1, index=0)
+        entry = dict(ev["entry"])
+        entry["prev_hash"] = "1" + "0" * 63
+        entry["hash"] = sha256_hex(entry["prev_hash"].encode(), leaf_hash(entry["payload"]).encode())
+        self.assertIs(verify_entry_evidence({**ev, "entry": entry}), False)
+
+    def test_tampered_payload_or_hash_breaks_chain(self) -> None:
+        ev = self.good_evidence()
+        entry = dict(ev["entry"])
+        entry["payload"] = {"n": 999}
+        self.assertIs(verify_entry_evidence({**ev, "entry": entry}), False)
+        entry = dict(ev["entry"])
+        entry["hash"] = "f" * 64
+        self.assertIs(verify_entry_evidence({**ev, "entry": entry}), False)
+        entry = dict(ev["entry"])
+        entry["prev_hash"] = "0" * 64  # wrong predecessor for a non-first entry
+        entry["hash"] = sha256_hex(entry["prev_hash"].encode(), leaf_hash(entry["payload"]).encode())
+        self.assertIs(verify_entry_evidence({**ev, "entry": entry}), False)
+
+    def test_tampered_proof_or_root_is_rejected(self) -> None:
+        for total in (1, 2, 3, 6, 7):
+            with self.log._lock:
+                self.log._entries.clear()
+            self.append(total)
+            ev = self.call(f"/v1/evidence/{total - 1}")[1]
+            self.assertIs(verify_entry_evidence({**ev, "root": "a" * 64}), False, total)
+            if ev["proof"]:
+                broken = [dict(step) for step in ev["proof"]]
+                broken[0]["hash"] = "e" * 64
+                self.assertIs(verify_entry_evidence({**ev, "proof": broken}), False, total)
+                flipped = [dict(step) for step in ev["proof"]]
+                flipped[0]["position"] = "left" if flipped[0]["position"] == "right" else "right"
+                self.assertIs(verify_entry_evidence({**ev, "proof": flipped}), False, total)
+                self.assertIs(verify_entry_evidence({**ev, "proof": ev["proof"][:-1]}), False, total)
+                self.assertIs(
+                    verify_entry_evidence({**ev, "proof": ev["proof"]
+                                           + [{"position": "right", "hash": "c" * 64}]}), False, total)
+        # non-list / malformed nodes
+        ev = self.good_evidence()
+        for proof in (None, "x", [None], [{"position": "up", "hash": "a" * 64}],
+                      [{"position": "left", "hash": "zz"}],
+                      [{"position": "left", "hash": "a" * 64, "extra": 1}], [{"hash": "a" * 64}]):
+            self.assertIs(verify_entry_evidence({**ev, "proof": proof}), False, proof)
+
+    def test_proof_shape_is_bound_to_size(self) -> None:
+        # A duplicate-last tree gives an entry the same path shape for all sizes in one power-of-two
+        # band (e.g. index 2: 4 levels for sizes 9..16); sizes from other bands have a different
+        # number of levels and must be rejected even though every hash in the bundle is genuine.
+        self.append(10)
+        ev = self.call("/v1/evidence/2")[1]
+        self.assertEqual(len(ev["proof"]), 4)
+        for wrong_size in (2, 3, 4, 5, 8, 17, 32, 100):
+            self.assertIs(verify_entry_evidence({**ev, "size": wrong_size}), False, wrong_size)
+        # size <= index is always invalid
+        self.assertIs(verify_entry_evidence({**ev, "size": 0}), False)
+
+    def test_odd_last_sibling_must_be_self_duplicate(self) -> None:
+        # For the last entry of an odd-size tree the first sibling is the duplicated node, i.e. it
+        # must equal the entry hash itself. A forged bundle with a distinct sibling and a re-derived
+        # self-consistent root fools a naive inclusion check but must fail the size-aware checker.
+        self.append(5)
+        ev = self.call("/v1/evidence/4")[1]
+        self.assertEqual(ev["proof"][0]["position"], "right")
+        self.assertEqual(ev["proof"][0]["hash"], ev["entry"]["hash"])
+        forged_proof = [dict(step) for step in ev["proof"]]
+        forged_proof[0]["hash"] = "9" * 64
+        current = ev["entry"]["hash"]
+        for step in forged_proof:
+            current = (node_hash(current, step["hash"]) if step["position"] == "right"
+                       else node_hash(step["hash"], current))
+        forged = {**ev, "proof": forged_proof, "root": current}
+        self.assertTrue(verify_inclusion(forged["entry"]["hash"], forged_proof, current))
+        self.assertFalse(verify_entry_evidence(forged))
+
+    def test_never_raises_on_garbage(self) -> None:
+        for garbage in (0, False, "", b"{}", object(), {"entry": object()},
+                        {"entry": {}, "size": {}, "root": {}, "proof": {}},
+                        {"entry": {"index": {}}, "size": -1, "root": 1, "proof": [object()]}):
+            self.assertIs(verify_entry_evidence(garbage), False, garbage)
 
 
 class ConsistencyProofTests(unittest.TestCase):

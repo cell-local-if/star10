@@ -15,9 +15,10 @@ from .app import (  # noqa: F401
     make_handler,
     serve,
     verify_consistency,
+    verify_entry_evidence,
     verify_inclusion,
 )
 
 __all__ = ["AuditError", "AuditLog", "Entry", "EntryNotFound", "InvalidRequest", "consistency_proof",
            "inclusion_proof", "leaf_hash", "merkle_root", "node_hash", "sha256_hex", "make_handler", "serve",
-           "verify_consistency", "verify_inclusion"]
+           "verify_consistency", "verify_entry_evidence", "verify_inclusion"]

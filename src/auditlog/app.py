@@ -81,6 +81,64 @@ def verify_inclusion(entry_hash: str, proof: list[dict[str, str]], root: str) ->
     return current == root
 
 
+def _is_json_value(value: Any) -> bool:
+    """True only for structures json.loads can produce (used to validate an evidence payload)."""
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return True
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False  # tuples, bytes, sets and other non-JSON types are rejected
+
+
+def verify_entry_evidence(evidence: Any) -> bool:
+    """Offline check of a single-entry evidence bundle: True iff it is internally consistent with the
+    published hashing rules (chain hash, leaf hash, size-shaped inclusion proof, root).  Pure: touches
+    no network or process state and never raises."""
+    try:
+        if not isinstance(evidence, dict) or set(evidence) != {"entry", "size", "root", "proof"}:
+            return False
+        entry, size, root, proof = evidence["entry"], evidence["size"], evidence["root"], evidence["proof"]
+        if (not isinstance(size, int) or isinstance(size, bool) or size < 0
+                or not _is_hash64(root) or not isinstance(proof, list)):
+            return False
+        if not isinstance(entry, dict) or set(entry) != {"index", "hash", "prev_hash", "payload"}:
+            return False
+        index, entry_hash, prev_hash, payload = (entry["index"], entry["hash"],
+                                                 entry["prev_hash"], entry["payload"])
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < size:
+            return False
+        if not _is_hash64(entry_hash) or not _is_hash64(prev_hash):
+            return False
+        if not isinstance(payload, (dict, list)) or not _is_json_value(payload):
+            return False
+        if index == 0 and prev_hash != ZERO:
+            return False
+        if entry_hash != sha256_hex(prev_hash.encode(), leaf_hash(payload).encode()):
+            return False
+        # Size-aware inclusion: walk the index's path through the duplicate-last size-`size` tree,
+        # which binds the claimed size to the proof (a wrong-length or mis-positioned proof fails).
+        current, pos, count = entry_hash, index, size
+        for step in proof:
+            if count <= 1:
+                return False
+            if (not isinstance(step, dict) or set(step) != {"position", "hash"}
+                    or not _is_hash64(step["hash"])):
+                return False
+            if step["position"] != ("right" if pos % 2 == 0 else "left"):
+                return False
+            if count % 2 == 1 and pos == count - 1 and step["hash"] != current:
+                return False  # odd level duplicates the last node: the sibling is the node itself
+            current = node_hash(current, step["hash"]) if step["position"] == "right" \
+                else node_hash(step["hash"], current)
+            count = (count + 1) // 2
+            pos //= 2
+        return count == 1 and current == root
+    except Exception:
+        return False
+
+
 # --- Consistency proofs -----------------------------------------------------
 #
 # The duplicate-last tree satisfies, for every n >= 2 and with k the largest
@@ -292,6 +350,23 @@ class AuditLog:
             return {"index": entry.index, "entry_hash": entry.hash, "size": len(leaves),
                     "root": merkle_root(leaves), "proof": inclusion_proof(leaves, entry.index)}
 
+    def evidence(self, index: Any) -> dict[str, Any]:
+        """Portable single-entry bundle for offline verification: entry + fixed snapshot size/root + proof.
+
+        The prefix, root and proof are read under one lock acquisition, so later appends only enlarge
+        the log and never change a bundle already returned.
+        """
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            raise InvalidRequest("index must be a non-negative integer")
+        with self._lock:
+            if index >= len(self._entries):
+                raise EntryNotFound(f"no entry at index {index}")
+            leaves = [e.hash for e in self._entries]
+            entry = self._entries[index]
+            size = len(leaves)
+            return {"entry": entry.as_json(), "size": size, "root": merkle_root(leaves),
+                    "proof": inclusion_proof(leaves, index)}
+
     def proofs_page(self, snapshot_size: Any, start: Any, limit: Any) -> dict[str, Any]:
         """Inclusion proofs for one page of a fixed entry prefix.
 
@@ -393,6 +468,10 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, log.root())
                 if len(parts) == 3 and parts[:2] == ["v1", "entries"]:
                     return self._send(200, log.entry(int(parts[2]) if parts[2].isdigit() else parts[2]).as_json())
+                if len(parts) == 3 and parts[:2] == ["v1", "evidence"]:
+                    raw_index = parts[2]
+                    evidence_index = int(raw_index) if all("0" <= ch <= "9" for ch in raw_index) else raw_index
+                    return self._send(200, log.evidence(evidence_index))
                 if len(parts) == 4 and parts[:3] == ["v1", "proof", "inclusion"]:
                     return self._send(200, log.proof(int(parts[3]) if parts[3].isdigit() else parts[3]))
                 if self.path.split("?", 1)[0] == "/v1/proof/consistency":

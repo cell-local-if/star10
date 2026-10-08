@@ -36,6 +36,24 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 `200 {"index","entry_hash","size","root","proof":[{"position":"left|right","hash":<hex>}, ...]}`
 （`position` 表示**兄弟节点在左还是在右**；校验时按此顺序拼接）。
 
+### `GET /v1/evidence/{index}`
+可移植的**单条证据导出**：一次返回第三方离线校验所需的完整材料。
+- `index` 只接受十进制非负整数（`0-9`，无空白、正负号、小数、指数或其他进制写法），否则 `400 invalid_request`；
+  `index >= 当前条目数` 返回 `404 not_found`。
+- `200`：
+```json
+{"entry": {"index","hash","prev_hash","payload"}, "size": <int>, "root": <hex>,
+ "proof": [{"position":"left|right","hash":<hex>}, ...]}
+```
+  `entry` 结构同追加入口返回；`size`、`root` 为请求处理时**一次锁定读取**得到的前缀大小与 Merkle 根；
+  `proof` 为该条目到根的包含证明（从叶到根，`position` 表示兄弟节点在当前节点左侧或右侧，`hash` 为
+  64 位小写十六进制）。后续追加只扩大日志，不改变已返回证据的有效性。
+- 离线校验：`verify_entry_evidence(evidence) -> bool`，纯函数，不访问网络或进程状态，只凭证据对象与
+  上述哈希规则判断。字段缺失/多余、类型错误、非法 `size`/`index`/哈希、`payload` 不是 JSON 对象或数组
+  （空对象 `{}` 与空数组 `[]` 合法）、首条 `prev_hash` 不为 64 个 0、`entry.hash` 与
+  `sha256(prev_hash || leaf_hash(payload))` 不一致、或包含证明结合 `size` 重算不等于 `root`，
+  一律返回 `False`，且不抛异常；合法证据还要求 `index < size`。
+
 ### `GET /v1/proofs/inclusion?snapshot_size=<n>&start=<i>&limit=<m>`
 按**固定条目前缀**分页读取包含证明，用于批量证据导出与离线逐条校验。
 - 三个参数各出现一次：`snapshot_size`、`start` 为非负十进制整数，`limit` 为 1–100 的十进制整数；
@@ -74,5 +92,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 
 ## 未实现（后续任务候选，非固定题单）
 
-封存与外部锚定、证据导出与离线校验器、签名与密钥轮换、保留策略与裁剪、
+封存与外部锚定、签名与密钥轮换、保留策略与裁剪、
 并发追加下的树一致性、与外部时间源绑定、失败注入与审计。
