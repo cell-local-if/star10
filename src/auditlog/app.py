@@ -70,15 +70,28 @@ def inclusion_proof(leaves: list[str], index: int) -> list[dict[str, str]]:
     return proof
 
 
-def verify_inclusion(entry_hash: str, proof: list[dict[str, str]], root: str) -> bool:
-    if not isinstance(entry_hash, str) or len(entry_hash) != 64 or not isinstance(proof, list) or not isinstance(root, str):
-        return False
-    current = entry_hash
-    for step in proof:
-        if not isinstance(step, dict) or step.get("position") not in {"left", "right"} or not isinstance(step.get("hash"), str):
+def verify_inclusion(entry_hash: Any, proof: Any, root: Any) -> bool:
+    """Offline inclusion check against the published encoding: True iff `entry_hash` folds through
+    every {position, hash} sibling in `proof` (leaf to root) to exactly `root`.
+
+    Boundary contract: entry_hash/root and every node hash must be 64 lowercase ASCII hex chars;
+    proof must be a list whose nodes are dicts with exactly the keys position ("left"|"right") and
+    hash.  An empty proof is accepted only when entry_hash == root (both well-formed).  Any other
+    shape, type or encoding returns False — never raises, even for recursive or hostile inputs.
+    """
+    try:
+        if not _is_hash64(entry_hash) or not _is_hash64(root) or not isinstance(proof, list):
             return False
-        current = node_hash(current, step["hash"]) if step["position"] == "right" else node_hash(step["hash"], current)
-    return current == root
+        current = entry_hash
+        for step in proof:
+            if (not isinstance(step, dict) or set(step) != {"position", "hash"}
+                    or step["position"] not in {"left", "right"} or not _is_hash64(step["hash"])):
+                return False
+            current = node_hash(current, step["hash"]) if step["position"] == "right" \
+                else node_hash(step["hash"], current)
+        return current == root
+    except Exception:
+        return False
 
 
 def _is_json_value(value: Any) -> bool:
