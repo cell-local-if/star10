@@ -7,8 +7,9 @@ import unittest
 import urllib.error
 import urllib.request
 
-from auditlog import (AuditLog, EntryNotFound, InvalidRequest, inclusion_proof, leaf_hash, merkle_root,
-                      node_hash, sha256_hex, verify_consistency, verify_entry_evidence, verify_inclusion)
+from auditlog import (AuditLog, EntryNotFound, InvalidRequest, inclusion_proof, is_external_time, leaf_hash,
+                      merkle_root, node_hash, seal_id_of, sha256_hex, verify_consistency,
+                      verify_entry_evidence, verify_inclusion, verify_seal)
 
 
 class MerkleUnitTests(unittest.TestCase):
@@ -646,6 +647,302 @@ class ConsistencyProofTests(unittest.TestCase):
     def test_unknown_route_still_404(self) -> None:
         self.assertEqual(self.call("/v1/proof/consistency/")[0], 404)
         self.assertEqual(self.call("/v1/proof/unknown?from=0&to=1")[0], 404)
+
+
+class SealTests(unittest.TestCase):
+    """POST /v1/seals, GET /v1/seals/{seal_id} and the offline verify_seal checker."""
+
+    GOOD_TIME = "2026-10-08T12:34:56Z"
+    GOOD_REF = "block-1700000"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from auditlog import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.log = cls.server.log
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        with self.log._lock:
+            self.log._entries.clear()
+            self.log._seals.clear()
+
+    def call(self, method: str, path: str, body=None, raw: bytes | None = None):
+        data = raw if raw is not None else (None if body is None else json.dumps(body).encode())
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def append(self, n: int) -> None:
+        for i in range(n):
+            self.log.append({"n": i, "note": "x" * i})
+
+    # --- creation -----------------------------------------------------------
+
+    def test_create_seal_locks_size_and_root_and_has_exact_shape(self) -> None:
+        self.append(3)
+        snapshot = self.log.root()
+        status, body = self.call("POST", "/v1/seals",
+                                 {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(set(body), {"seal_id", "size", "root", "external_ref", "external_time"})
+        self.assertEqual(body["size"], snapshot["size"])
+        self.assertEqual(body["root"], snapshot["root"])
+        self.assertEqual(body["external_ref"], self.GOOD_REF)
+        self.assertEqual(body["external_time"], self.GOOD_TIME)
+        self.assertRegex(body["seal_id"], r"^[0-9a-f]{64}$")
+        # independently recomputed from the documented canonical form
+        canonical = json.dumps(
+            {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME,
+             "root": body["root"], "size": body["size"]},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self.assertEqual(body["seal_id"], sha256_hex(b"\x02", canonical))
+
+    def test_seal_on_empty_log_uses_zero_root(self) -> None:
+        status, body = self.call("POST", "/v1/seals",
+                                 {"external_ref": "r", "external_time": self.GOOD_TIME})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["size"], 0)
+        self.assertEqual(body["root"], "0" * 64)
+        self.assertTrue(verify_seal(body))
+
+    def test_same_snapshot_and_inputs_is_idempotent_and_fetch_returns_copy(self) -> None:
+        self.append(2)
+        _, first = self.call("POST", "/v1/seals",
+                             {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME})
+        _, second = self.call("POST", "/v1/seals",
+                              {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME})
+        self.assertEqual(first, second)
+        status, fetched = self.call("GET", f"/v1/seals/{first['seal_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched, first)
+
+    def test_seal_record_is_immutable_after_later_appends(self) -> None:
+        self.append(2)
+        _, sealed = self.call("POST", "/v1/seals",
+                              {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME})
+        self.append(5)
+        _, fetched = self.call("GET", f"/v1/seals/{sealed['seal_id']}")
+        self.assertEqual(fetched, sealed)
+        self.assertEqual(self.log.size(), 7)
+        # a fresh seal binds the new, bigger snapshot
+        _, later = self.call("POST", "/v1/seals",
+                             {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME})
+        self.assertEqual(later["size"], 7)
+        self.assertNotEqual(later["root"], sealed["root"])
+        self.assertNotEqual(later["seal_id"], sealed["seal_id"])
+
+    def test_unicode_ref_is_canonicalized_with_ensure_ascii_false(self) -> None:
+        ref = "锚点-✓-Ω"
+        status, body = self.call("POST", "/v1/seals",
+                                 {"external_ref": ref, "external_time": self.GOOD_TIME})
+        self.assertEqual(status, 201, body)
+        canonical = json.dumps(
+            {"external_ref": ref, "external_time": self.GOOD_TIME,
+             "root": body["root"], "size": body["size"]},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self.assertEqual(body["seal_id"], sha256_hex(b"\x02", canonical))
+        self.assertTrue(verify_seal(body))
+
+    # --- invalid create bodies ---------------------------------------------
+
+    def test_invalid_bodies_all_400(self) -> None:
+        bad_bodies = [
+            {},
+            {"external_ref": self.GOOD_REF},
+            {"external_time": self.GOOD_TIME},
+            {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME, "extra": 1},
+            {"external_ref": "", "external_time": self.GOOD_TIME},
+            {"external_ref": 3, "external_time": self.GOOD_TIME},
+            {"external_ref": None, "external_time": self.GOOD_TIME},
+            {"external_ref": ["r"], "external_time": self.GOOD_TIME},
+            {"external_ref": True, "external_time": self.GOOD_TIME},
+        ]
+        for body in bad_bodies:
+            status, response = self.call("POST", "/v1/seals", body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(response["error"]["code"], "invalid_request", body)
+        # top-level non-objects are invalid too (arrays/scalars accepted by JSON parser)
+        for raw in (b"[]", b'"x"', b"3", b"null", b"not json", b""):
+            status, response = self.call("POST", "/v1/seals", raw=raw)
+            self.assertEqual(status, 400, raw)
+            self.assertEqual(response["error"]["code"], "invalid_request", raw)
+        # failed creation must not store anything
+        with self.log._lock:
+            self.assertEqual(self.log._seals, {})
+
+    def test_invalid_external_time_all_400(self) -> None:
+        bad_times = [
+            "2026-10-08T12:34:56+00:00",   # offset
+            "2026-10-08T12:34:56+08:00",
+            "2026-10-08T20:34:56-08:00",
+            "2026-10-08T12:34:56",         # no Z
+            "2026-10-08t12:34:56z",        # wrong case
+            "2026-10-08 12:34:56Z",        # space instead of T
+            "2026-10-08T12:34:56Z ",       # trailing whitespace
+            " 2026-10-08T12:34:56Z",       # leading whitespace
+            "2026-10-08T12:34:56.000Z",    # fractional seconds
+            "2026-10-08T12:34:56.0Z",
+            "2026-10-08T12:34:60Z",        # leap second / bad second
+            "2026-10-08T12:60:56Z",        # bad minute
+            "2026-10-08T24:00:00Z",        # bad hour
+            "2026-13-08T12:34:56Z",        # bad month
+            "2026-10-00T12:34:56Z",        # day zero
+            "2026-10-32T12:34:56Z",        # bad day
+            "2026-02-29T12:34:56Z",        # not a leap year
+            "2026-02-30T12:34:56Z",
+            "2026-04-31T12:34:56Z",        # April has 30 days
+            "2026-1-8T12:34:56Z",          # not zero-padded
+            "2026-10-8T12:34:56Z",
+            "2026-10-08T12:34:5Z",
+            "26-10-08T12:34:56Z",          # two-digit year
+            "2026-10-08T12:34:56ZZ",
+            "2026/10/08T12:34:56Z",
+            "Thu, 08 Oct 2026 12:34:56 GMT",
+            1234567890,                    # epoch number
+            None,
+            True,
+            3.5,
+        ]
+        for value in bad_times:
+            status, response = self.call(
+                "POST", "/v1/seals", {"external_ref": self.GOOD_REF, "external_time": value})
+            self.assertEqual(status, 400, value)
+            self.assertEqual(response["error"]["code"], "invalid_request", value)
+
+    def test_calendar_edge_times_accepted(self) -> None:
+        for value in ("2024-02-29T00:00:00Z",   # leap day
+                      "2000-02-29T23:59:59Z",   # leap year divisible by 400
+                      "2026-12-31T23:59:59Z",
+                      "2026-01-01T00:00:00Z",
+                      "0000-01-01T00:00:00Z",
+                      "9999-12-31T23:59:59Z"):
+            status, response = self.call(
+                "POST", "/v1/seals", {"external_ref": self.GOOD_REF, "external_time": value})
+            self.assertEqual(status, 201, value)
+            self.assertEqual(response["external_time"], value)
+
+    # --- fetch --------------------------------------------------------------
+
+    def test_get_missing_seal_is_404(self) -> None:
+        status, body = self.call("GET", f"/v1/seals/{'a' * 64}")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_get_malformed_seal_id_is_400(self) -> None:
+        bad = [
+            "z" * 64,                   # non-hex
+            "A" * 64,                   # uppercase
+            "a" * 63,                   # too short
+            "a" * 65,                   # too long
+            "a%20" + "a" * 62,         # whitespace (URL-encoded; raw trailing space is cut by request line)
+            "%20" + "a" * 64,
+            "a" * 32 + "-" + "a" * 31,  # dash
+            "0x" + "a" * 62,
+        ]
+        for seal_id in bad:
+            status, body = self.call("GET", f"/v1/seals/{seal_id}")
+            self.assertEqual(status, 400, seal_id)
+            self.assertEqual(body["error"]["code"], "invalid_request", seal_id)
+
+    def test_seal_routes_do_not_shadow_other_routes(self) -> None:
+        self.assertEqual(self.call("GET", "/v1/seals")[0], 404)
+        self.assertEqual(self.call("GET", "/v1/seals/")[0], 404)
+        self.assertEqual(self.call("GET", "/v1/seals/x/y")[0], 404)
+        self.assertEqual(self.call("POST", "/v1/seals/x", raw=b"{}")[0], 404)
+        self.assertEqual(self.call("POST", "/v1/nope", raw=b"{}")[0], 404)
+
+    # --- offline verifier ---------------------------------------------------
+
+    def good_seal(self) -> dict:
+        self.append(4)
+        return self.call("POST", "/v1/seals",
+                         {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME})[1]
+
+    def test_verifier_accepts_real_seals(self) -> None:
+        for total in (0, 1, 2, 7, 10):
+            with self.log._lock:
+                self.log._entries.clear()
+                self.log._seals.clear()
+            self.append(total)
+            seal = self.call("POST", "/v1/seals",
+                             {"external_ref": self.GOOD_REF, "external_time": self.GOOD_TIME})[1]
+            self.assertIs(verify_seal(seal), True, seal)
+            self.assertEqual(seal["size"], total)
+
+    def test_verifier_rejects_non_dict_and_wrong_shape(self) -> None:
+        seal = self.good_seal()
+        for bad in (None, 1, "x", [], json.dumps(seal), b"{}", object()):
+            self.assertIs(verify_seal(bad), False, bad)
+        for key in ("seal_id", "size", "root", "external_ref", "external_time"):
+            missing = dict(seal)
+            del missing[key]
+            self.assertIs(verify_seal(missing), False, key)
+        self.assertIs(verify_seal({**seal, "extra": 1}), False)
+
+    def test_verifier_rejects_bad_size(self) -> None:
+        seal = self.good_seal()
+        for size in (-1, "4", 4.0, True, None, [4], {}):
+            self.assertIs(verify_seal({**seal, "size": size}), False, size)
+
+    def test_verifier_rejects_bad_root_and_seal_id(self) -> None:
+        seal = self.good_seal()
+        for value in ("a" * 63, "A" * 64, "g" * 64, None, 123, b"a" * 64, ""):
+            self.assertIs(verify_seal({**seal, "root": value}), False, ("root", value))
+            self.assertIs(verify_seal({**seal, "seal_id": value}), False, ("seal_id", value))
+
+    def test_verifier_rejects_bad_ref(self) -> None:
+        seal = self.good_seal()
+        for ref in ("", 0, None, True, ["r"], {}, b"r"):
+            self.assertIs(verify_seal({**seal, "external_ref": ref}), False, ref)
+
+    def test_verifier_rejects_bad_time(self) -> None:
+        seal = self.good_seal()
+        for value in ("2026-10-08T12:34:56+00:00", "2026-10-08T12:34:56", "2026-13-08T12:34:56Z",
+                      "2026-02-29T12:34:56Z", "2026-10-08T12:34:60Z", " 2026-10-08T12:34:56Z",
+                      "2026-10-08T12:34:56.0Z", None, 1, True, 3.5):
+            self.assertIs(verify_seal({**seal, "external_time": value}), False, value)
+
+    def test_verifier_rejects_tampered_any_field(self) -> None:
+        seal = self.good_seal()
+        tampered = {**seal, "size": seal["size"] + 1}
+        self.assertIs(verify_seal(tampered), False)
+        tampered = {**seal, "root": "1" if seal["root"][0] != "1" else "2" + seal["root"][1:]}
+        self.assertIs(verify_seal(tampered), False)
+        tampered = {**seal, "external_ref": seal["external_ref"] + "x"}
+        self.assertIs(verify_seal(tampered), False)
+        tampered = {**seal, "external_time": "2026-10-08T12:34:57Z"}
+        self.assertIs(verify_seal(tampered), False)
+        # a self-consistent forgery over different fields still needs a matching seal_id;
+        # recomputing over a changed field yields a distinct id that the endpoint never stored
+        forged = {**seal, "external_ref": "other"}
+        forged["seal_id"] = seal_id_of(forged["size"], forged["root"],
+                                       forged["external_ref"], forged["external_time"])
+        self.assertIs(verify_seal(forged), True)   # internally consistent -> verifies as its own seal
+        self.assertNotEqual(forged["seal_id"], seal["seal_id"])
+        self.assertEqual(self.call("GET", f"/v1/seals/{forged['seal_id']}")[0], 404)
+
+    def test_verifier_never_raises_on_garbage(self) -> None:
+        for garbage in (0, False, "", object(), {"seal_id": object()},
+                        {"size": {}, "root": {}, "external_ref": {}, "external_time": {}, "seal_id": {}}):
+            self.assertIs(verify_seal(garbage), False, garbage)
+
+    def test_helper_predicate(self) -> None:
+        self.assertTrue(is_external_time(self.GOOD_TIME))
+        for value in ("2026-10-08T12:34:56+00:00", "", None, 5, True, "2026-10-08T12:34:56",
+                      "2026-02-29T00:00:00Z"):
+            self.assertFalse(is_external_time(value), value)
+        self.assertTrue(is_external_time("2024-02-29T00:00:00Z"))
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 - 规范化 JSON：`sort_keys=True, separators=(",", ":")`，UTF-8。
 - 叶哈希：`sha256(0x00 || canonical_json(payload))`
 - 内部节点：`sha256(0x01 || left_hex || right_hex)`
+- 封存标识：`sha256(0x02 || canonical_json({external_ref, external_time, root, size}))`
 - **条目哈希**：`sha256(prev_entry_hash_hex || leaf_hash_hex)`（链）
 - Merkle 根：自底向上两两配对；**某层为奇数时复制最后一个节点**；空日志的根是 `64 个 0`。
 
@@ -73,6 +74,34 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 ### `GET /v1/root`
 `200 {"root": <hex>, "size": <int>}`
 
+### `POST /v1/seals`
+可验证的**封存与外部锚定**：把调用方提供的外部引用与外部时间绑定到创建时一次锁定的当前 `(size, root)`。
+- 请求体**只能**含 `external_ref` 与 `external_time` 两个字段（多、少均为 `400 invalid_request`）：
+  - `external_ref`：非空字符串；
+  - `external_time`：严格 UTC RFC3339 的 `YYYY-MM-DDTHH:MM:SSZ`（真实合法日期时间），不接受本地时间、
+    时区偏移、小数秒、空白或任何非标准写法。
+- 服务不引入网络时间源、持久化文件或签名密钥，也不修改冻结文档；时间与引用完全由调用方提供。
+- **`201`**：
+```json
+{"seal_id": <hex64>, "size": <int>, "root": <hex>,
+ "external_ref": <string>, "external_time": "YYYY-MM-DDTHH:MM:SSZ"}
+```
+  返回记录**只含**上述五个字段；`size`、`root` 为本次调用在一次锁定读取中确定的前缀大小与 Merkle 根
+  （空日志为 `size: 0` 与 64 个 0 的根）。后续追加不得改变已返回的封存记录。
+- `seal_id`：对字段 `external_ref`、`external_time`、`root`、`size` 的对象按
+  `sort_keys=True, separators=(",", ":")`、`ensure_ascii=False` 生成 UTF-8 规范 JSON，再计算
+  `sha256(0x02 || canonical_json)` 的 64 位小写十六进制值。
+
+### `GET /v1/seals/{seal_id}`
+- `seal_id` 只接受 64 位小写十六进制；格式错误（含大写、长度不符、非 hex 字符）⇒ `400 invalid_request`；
+  不存在 ⇒ `404 not_found`。
+- `200`：返回与创建时一致的完整封存记录（五个字段，值不变）。
+- 离线校验：`verify_seal(seal) -> bool`，纯函数，不访问网络、进程状态或日志，只凭传入对象判断，且不抛异常。
+  对象必须**恰好**有 `seal_id`、`size`、`root`、`external_ref`、`external_time` 五个字段；`size` 为非负整数
+  且不是布尔值，`root` 与 `seal_id` 为 64 位小写十六进制，`external_ref` 为非空字符串，
+  `external_time` 符合同一严格 UTC 格式，且 `seal_id` 与按上述规则重算的值一致。任何字段缺失/多余、
+  类型或格式错误、摘要不一致，一律返回 `False`。
+
 ### `GET /v1/proof/consistency?from=<m>&to=<n>`
 两个日志大小之间的 **Merkle 一致性证明**：确认大小为 `m` 的旧前缀仍是大小为 `n` 的新根下的同一段前缀。
 - `from`、`to` 各出现一次，为非负十进制整数；不得有空白、正负号、小数、指数、非十进制字符、
@@ -92,5 +121,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 
 ## 未实现（后续任务候选，非固定题单）
 
-封存与外部锚定、签名与密钥轮换、保留策略与裁剪、
+签名与密钥轮换、保留策略与裁剪、
 并发追加下的树一致性、与外部时间源绑定、失败注入与审计。
