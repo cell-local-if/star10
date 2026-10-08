@@ -70,15 +70,29 @@ def inclusion_proof(leaves: list[str], index: int) -> list[dict[str, str]]:
     return proof
 
 
-def verify_inclusion(entry_hash: str, proof: list[dict[str, str]], root: str) -> bool:
-    if not isinstance(entry_hash, str) or len(entry_hash) != 64 or not isinstance(proof, list) or not isinstance(root, str):
-        return False
-    current = entry_hash
-    for step in proof:
-        if not isinstance(step, dict) or step.get("position") not in {"left", "right"} or not isinstance(step.get("hash"), str):
+def verify_inclusion(entry_hash: Any, proof: Any, root: Any) -> bool:
+    """Offline inclusion check against the published hash encoding.
+
+    True iff `entry_hash` and `root` are both 64-char lowercase ASCII hex strings, `proof` is a
+    list whose every node is exactly {"position": "left"|"right", "hash": <64-char lowercase hex>},
+    and folding the nodes leaf-to-root with node_hash (position says which side the sibling sits
+    on) reproduces `root`.  An empty proof verifies only when entry_hash == root.  Malformed
+    material (missing/extra fields, wrong types, case, non-hex, non-list containers, recursive
+    or hostile objects) yields False; the function never raises.
+    """
+    try:
+        if not _is_hash64(entry_hash) or not _is_hash64(root) or not isinstance(proof, list):
             return False
-        current = node_hash(current, step["hash"]) if step["position"] == "right" else node_hash(step["hash"], current)
-    return current == root
+        current = entry_hash
+        for step in proof:
+            if (not isinstance(step, dict) or set(step) != {"position", "hash"}
+                    or step["position"] not in {"left", "right"} or not _is_hash64(step["hash"])):
+                return False
+            current = node_hash(current, step["hash"]) if step["position"] == "right" \
+                else node_hash(step["hash"], current)
+        return current == root
+    except Exception:
+        return False
 
 
 def _is_json_value(value: Any) -> bool:
