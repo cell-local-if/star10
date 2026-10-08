@@ -452,10 +452,30 @@ class AuditLog:
             if index >= len(self._entries):
                 raise EntryNotFound(f"no entry at index {index}")
             leaves = [e.hash for e in self._entries]
-            entry = self._entries[index]
-            size = len(leaves)
-            return {"entry": entry.as_json(), "size": size, "root": merkle_root(leaves),
-                    "proof": inclusion_proof(leaves, index)}
+            return self._evidence_locked(leaves, index)
+
+    def evidence_by_hash(self, entry_hash: Any) -> dict[str, Any]:
+        """The same portable bundle as evidence(index), located by the entry's chain hash.
+
+        Strictly read-only: the format check happens before the lock, and the lookup plus bundle
+        construction never mutate the log, consume no index and leave no observable state on a
+        miss.  The matched entry, size, root and proof are all determined under one lock
+        acquisition, so the bundle always describes a single prefix snapshot even while concurrent
+        appends enlarge the log; later appends never invalidate a bundle already returned.
+        """
+        if not _is_hash64(entry_hash):
+            raise InvalidRequest("entry_hash must be 64 lowercase hexadecimal characters")
+        with self._lock:
+            leaves = [e.hash for e in self._entries]
+            index = next((i for i, candidate in enumerate(leaves) if candidate == entry_hash), None)
+            if index is None:
+                raise EntryNotFound(f"no entry with hash {entry_hash}")
+            return self._evidence_locked(leaves, index)
+
+    def _evidence_locked(self, leaves: list[str], index: int) -> dict[str, Any]:
+        """Build the {entry, size, root, proof} bundle for `index` from a leaves snapshot held under the lock."""
+        return {"entry": self._entries[index].as_json(), "size": len(leaves),
+                "root": merkle_root(leaves), "proof": inclusion_proof(leaves, index)}
 
     def proofs_page(self, snapshot_size: Any, start: Any, limit: Any) -> dict[str, Any]:
         """Inclusion proofs for one page of a fixed entry prefix.
@@ -587,6 +607,20 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, log.root())
                 if len(parts) == 3 and parts[:2] == ["v1", "entries"]:
                     return self._send(200, log.entry(int(parts[2]) if parts[2].isdigit() else parts[2]).as_json())
+                path_only = self.path.split("?", 1)[0]
+                if path_only == "/v1/evidence/by-hash" or path_only.startswith("/v1/evidence/by-hash/"):
+                    # This exact path shape is claimed: it must be /v1/evidence/by-hash/<entry_hash>
+                    # with exactly one non-empty segment, no query string and no missing/extra segment
+                    # (a trailing or doubled slash is an extra segment). Anything else is 400, while a
+                    # differently spelled route (e.g. /v1/evidence/by-hashx/...) still falls through to 404.
+                    if "?" in self.path:
+                        raise InvalidRequest("query parameters are not allowed on evidence by-hash lookups")
+                    if not path_only.startswith("/v1/evidence/by-hash/"):
+                        raise InvalidRequest("path must be /v1/evidence/by-hash/<entry_hash>")
+                    raw_hash = path_only[len("/v1/evidence/by-hash/"):]
+                    if not raw_hash or "/" in raw_hash:
+                        raise InvalidRequest("path must be /v1/evidence/by-hash/<entry_hash>")
+                    return self._send(200, log.evidence_by_hash(raw_hash))
                 if len(parts) == 3 and parts[:2] == ["v1", "evidence"]:
                     raw_index = parts[2]
                     evidence_index = int(raw_index) if all("0" <= ch <= "9" for ch in raw_index) else raw_index

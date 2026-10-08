@@ -55,6 +55,25 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
   `sha256(prev_hash || leaf_hash(payload))` 不一致、或包含证明结合 `size` 重算不等于 `root`，
   一律返回 `False`，且不抛异常；合法证据还要求 `index < size`。
 
+### `GET /v1/evidence/by-hash/{entry_hash}`
+按**条目链哈希**取得与按索引导出完全等价的单条证据，供只知道某条链哈希、不知道其下标的外部校验方使用。
+- 路径只能是 `/v1/evidence/by-hash/<entry_hash>` 这一种形态：`entry_hash` 只接受恰好 64 个字符的
+  小写十六进制串（`0-9`、`a-f`）；大写、空白、正负号、短于/长于 64、非十六进制字符或其他写法一律
+  `400 invalid_request`；缺少或增加路径段（如 `/v1/evidence/by-hash`、`/v1/evidence/by-hash/<h>/x`、
+  结尾斜杠）以及附带任何查询参数同样为 `400 invalid_request`。
+- 格式正确但当前日志中不存在该哈希 ⇒ `404 not_found`（空日志亦然）。
+- `200`：响应对象与 `GET /v1/evidence/{index}` **完全相同**——
+```json
+{"entry": {"index","hash","prev_hash","payload"}, "size": <int>, "root": <hex>,
+ "proof": [{"position":"left|right","hash":<hex>}, ...]}
+```
+  其中 `entry.index` 是该链哈希在本次日志中的唯一下标；`size`、`root` 与 `proof` 来自本次请求
+  **一次锁定读取**的同一个前缀快照，`proof` 可直接交给 `verify_entry_evidence` 离线验证。
+- 该查询为只读：不修改日志、不消耗新索引；命中失败不留任何可观察状态。响应一旦返回，其中的
+  `size`、`root`、`proof` 即固定，后续追加只扩大日志，不使旧证据失效；并发追加时同一响应中的
+  `entry`、`size`、`root`、`proof` 必属同一快照，不会拼接不同前缀的材料。请求体不参与匹配，
+  不影响命中、未命中或格式错误的结果。
+
 ### `GET /v1/proofs/inclusion?snapshot_size=<n>&start=<i>&limit=<m>`
 按**固定条目前缀**分页读取包含证明，用于批量证据导出与离线逐条校验。
 - 三个参数各出现一次：`snapshot_size`、`start` 为非负十进制整数，`limit` 为 1–100 的十进制整数；

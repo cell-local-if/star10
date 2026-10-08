@@ -504,6 +504,209 @@ class EntryEvidenceTests(unittest.TestCase):
             self.assertIs(verify_entry_evidence(garbage), False, garbage)
 
 
+class EvidenceByHashTests(unittest.TestCase):
+    """GET /v1/evidence/by-hash/{entry_hash}: the index evidence bundle located by chain hash."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from auditlog import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.log = cls.server.log
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        with self.log._lock:
+            self.log._entries.clear()
+
+    def call(self, path: str, method: str = "GET", raw: bytes | None = None):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=raw, method=method,
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def append(self, n: int) -> None:
+        for i in range(n):
+            self.log.append({"n": i, "note": "x" * i})
+
+    def test_hash_lookup_matches_index_evidence_for_every_entry(self) -> None:
+        for total in (1, 2, 3, 5, 8, 9):
+            with self.log._lock:
+                self.log._entries.clear()
+            self.append(total)
+            with self.log._lock:
+                hashes = [e.hash for e in self.log._entries]
+            for index, entry_hash in enumerate(hashes):
+                status, by_hash = self.call(f"/v1/evidence/by-hash/{entry_hash}")
+                self.assertEqual(status, 200, (total, entry_hash, by_hash))
+                _, by_index = self.call(f"/v1/evidence/{index}")
+                self.assertEqual(by_hash, by_index, (total, index))
+                self.assertEqual(set(by_hash), {"entry", "size", "root", "proof"})
+                self.assertEqual(by_hash["entry"]["index"], index)
+                self.assertEqual(by_hash["entry"]["hash"], entry_hash)
+                self.assertEqual(by_hash["size"], total)
+                self.assertTrue(verify_entry_evidence(by_hash), (total, index))
+                self.assertTrue(verify_inclusion(entry_hash, by_hash["proof"], by_hash["root"]))
+
+    def test_well_formed_but_unknown_hash_is_404_and_leaves_no_state(self) -> None:
+        self.assertEqual(self.call(f"/v1/evidence/by-hash/{'a' * 64}")[0], 404)  # empty log
+        self.append(3)
+        size_before = self.log.size()
+        unknown = sha256_hex(b"never appended")
+        status, body = self.call(f"/v1/evidence/by-hash/{unknown}")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+        self.assertEqual(self.log.size(), size_before)
+        # existing entries and index reads are untouched
+        for index in range(size_before):
+            self.assertEqual(self.call(f"/v1/evidence/{index}")[0], 200)
+
+    def test_malformed_hashes_all_400(self) -> None:
+        self.append(2)
+        good = self.log.entry(0).hash
+        bad = [
+            good.upper(),                              # uppercase
+            "A" * 64,
+            good[:-1],                                 # too short
+            good + "a",                                # too long
+            "g" * 64,                                  # non-hex letter
+            "%20" + "a" * 63,                          # leading whitespace (64 chars decoded)
+            "a" * 63 + "%20",                          # trailing whitespace (64 chars decoded)
+            "%20" + "a" * 62,                          # leading whitespace (short)
+            "-" + "a" * 63,                            # sign
+            "+" + "a" * 63,
+            "0x" + "a" * 62,                           # hex prefix spelling
+            "a" * 32 + "-" + "a" * 31,                 # dash inside
+            good[:32] + "/" + good[32:],               # slash inside (becomes an extra segment)
+            "",                                       # empty segment
+        ]
+        for value in bad:
+            status, body = self.call(f"/v1/evidence/by-hash/{value}")
+            self.assertEqual(status, 400, value)
+            self.assertEqual(body["error"]["code"], "invalid_request", value)
+        self.assertEqual(self.log.size(), 2)
+
+    def test_path_shape_and_query_strings_all_400(self) -> None:
+        self.append(1)
+        good = self.log.entry(0).hash
+        bad_paths = [
+            "/v1/evidence/by-hash",                    # missing segment
+            "/v1/evidence/by-hash/",                   # empty segment
+            f"/v1/evidence/by-hash/{good}/",           # trailing slash = extra segment
+            f"/v1/evidence/by-hash//{good}",           # doubled slash
+            f"/v1/evidence/by-hash/{good}//",
+            f"/v1/evidence/by-hash/{good}/extra",      # extra segment
+            f"/v1/evidence/by-hash/{good}?x=1",        # unknown query parameter
+            f"/v1/evidence/by-hash/{good}?",           # bare query separator
+            f"/v1/evidence/by-hash/{good}?foo",
+            "/v1/evidence/by-hash?x=1",
+            f"/v1/evidence/by-hash/{good}%2f",         # percent-encoded slash stays literal -> malformed hash
+        ]
+        for path in bad_paths:
+            status, body = self.call(path)
+            self.assertEqual(status, 400, path)
+            self.assertEqual(body["error"]["code"], "invalid_request", path)
+
+    def test_unknown_routes_keep_404(self) -> None:
+        good = "a" * 64
+        self.assertEqual(self.call("/v1/evidence/by-hashx/aaa")[0], 404)
+        self.assertEqual(self.call(f"/v1/evidencex/by-hash/{good}")[0], 404)
+        self.assertEqual(self.call("/v1/evidence/other")[0], 400)  # baseline: non-numeric index stays 400
+        self.assertEqual(self.call("/nope")[0], 404)
+
+    def test_request_body_does_not_participate_in_matching(self) -> None:
+        self.append(2)
+        good = self.log.entry(0).hash
+        unknown = sha256_hex(b"other")
+        # a body on the hit, the miss and the malformed path changes nothing
+        status, with_body = self.call(f"/v1/evidence/by-hash/{good}", raw=b'{"anything": 1}')
+        self.assertEqual(status, 200)
+        _, without_body = self.call(f"/v1/evidence/by-hash/{good}")
+        self.assertEqual(with_body, without_body)
+        self.assertEqual(self.call(f"/v1/evidence/by-hash/{unknown}", raw=b"{}")[0], 404)
+        self.assertEqual(self.call("/v1/evidence/by-hash/ZZ", raw=b"{}")[0], 400)
+
+    def test_returned_bundle_survives_later_appends(self) -> None:
+        self.append(3)
+        target = self.log.entry(1).hash
+        _, before = self.call(f"/v1/evidence/by-hash/{target}")
+        self.assertEqual(before["size"], 3)
+        self.append(20)
+        _, after = self.call(f"/v1/evidence/by-hash/{target}")
+        self.assertEqual(after["size"], 23)
+        self.assertNotEqual(after["root"], before["root"])
+        self.assertTrue(verify_entry_evidence(before))
+        self.assertTrue(verify_entry_evidence(after))
+        self.assertEqual(before["entry"], after["entry"])
+
+    def test_concurrent_appends_keep_each_response_one_snapshot(self) -> None:
+        self.append(5)
+        target = self.log.entry(2).hash
+        bundles: list[dict] = []
+
+        def fetch() -> None:
+            for _ in range(100):
+                status, body = self.call(f"/v1/evidence/by-hash/{target}")
+                self.assertEqual(status, 200, body)
+                bundles.append(body)
+
+        def append_more() -> None:
+            for i in range(150):
+                self.log.append({"k": i, "pad": "y" * 4})
+
+        readers = [threading.Thread(target=fetch) for _ in range(3)]
+        writers = [threading.Thread(target=append_more) for _ in range(3)]
+        for thread in readers + writers:
+            thread.start()
+        for thread in readers + writers:
+            thread.join()
+        self.assertTrue(bundles)
+        with self.log._lock:
+            leaves = [e.hash for e in self.log._entries]
+        for bundle in bundles:
+            # every part belongs to the same prefix snapshot: entry, size-bound proof and root agree
+            self.assertEqual(bundle["entry"]["index"], 2)
+            self.assertEqual(bundle["entry"]["hash"], target)
+            self.assertTrue(verify_entry_evidence(bundle))
+            self.assertTrue(verify_inclusion(target, bundle["proof"], bundle["root"]))
+            # the root must be the genuine root of exactly the claimed (stable) prefix
+            self.assertEqual(bundle["root"], merkle_root(leaves[:bundle["size"]]))
+            self.assertGreaterEqual(bundle["size"], 5)
+
+    def test_lookup_is_read_only_under_contention(self) -> None:
+        self.append(10)
+        unknown = sha256_hex(b"missing")
+        stop = threading.Event()
+
+        def miss_repeatedly() -> None:
+            while not stop.is_set():
+                self.call(f"/v1/evidence/by-hash/{unknown}")
+
+        def append_some() -> None:
+            for i in range(200):
+                self.log.append({"i": i})
+
+        threads = [threading.Thread(target=miss_repeatedly) for _ in range(2)]
+        writers = [threading.Thread(target=append_some) for _ in range(2)]
+        for thread in threads + writers:
+            thread.start()
+        for thread in writers:
+            thread.join()
+        stop.set()
+        for thread in threads:
+            thread.join()
+        # failed lookups consumed no indices: exactly the appended entries exist
+        self.assertEqual(self.log.size(), 410)
+
+
 class ConsistencyProofTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
