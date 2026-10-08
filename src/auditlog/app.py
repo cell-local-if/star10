@@ -192,6 +192,55 @@ def verify_consistency(old_size: Any, new_size: Any, old_root: Any, new_root: An
     return used == len(proof) and old == old_root and new == new_root
 
 
+def _is_json_value(value: Any) -> bool:
+    """True iff `value` is made of JSON types only (dict keys must be strings)."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
+def verify_entry_evidence(evidence: Any) -> bool:
+    """Offline check of a `GET /v1/evidence/{index}` response: True iff the evidence is a
+    well-formed object whose entry chains correctly and whose inclusion proof recomputes to
+    `root`.  Pure function of the evidence and the public hash rules; never raises."""
+    try:
+        if not isinstance(evidence, dict) or set(evidence) != {"entry", "size", "root", "proof"}:
+            return False
+        size, root, proof = evidence["size"], evidence["root"], evidence["proof"]
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            return False
+        if not _is_hash64(root):
+            return False
+        if not isinstance(proof, list):
+            return False
+        for node in proof:
+            if (not isinstance(node, dict) or set(node) != {"position", "hash"}
+                    or node["position"] not in {"left", "right"} or not _is_hash64(node["hash"])):
+                return False
+        entry = evidence["entry"]
+        if not isinstance(entry, dict) or set(entry) != {"index", "hash", "prev_hash", "payload"}:
+            return False
+        index = entry["index"]
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < size:
+            return False
+        if not _is_hash64(entry["hash"]) or not _is_hash64(entry["prev_hash"]):
+            return False
+        if index == 0 and entry["prev_hash"] != ZERO:
+            return False
+        payload = entry["payload"]
+        if not isinstance(payload, (dict, list)) or not _is_json_value(payload):
+            return False
+        if sha256_hex(entry["prev_hash"].encode(), leaf_hash(payload).encode()) != entry["hash"]:
+            return False
+        return verify_inclusion(entry["hash"], proof, root)
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class Entry:
     index: int
@@ -343,6 +392,19 @@ class AuditLog:
                     "old_root": merkle_root(leaves[:old_size]), "new_root": merkle_root(leaves),
                     "proof": consistency_proof(leaves, old_size, new_size)}
 
+    def evidence(self, index: Any) -> dict[str, Any]:
+        """Portable evidence for one entry: the entry itself plus the log size, Merkle root
+        and inclusion proof of one snapshot, all determined under a single lock acquisition,
+        so concurrent appends can never change an already-assembled evidence object."""
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            raise InvalidRequest("index must be a non-negative integer")
+        with self._lock:
+            leaves = [e.hash for e in self._entries]
+            if index >= len(leaves):
+                raise EntryNotFound(f"no entry at index {index}")
+            return {"entry": self._entries[index].as_json(), "size": len(leaves),
+                    "root": merkle_root(leaves), "proof": inclusion_proof(leaves, index)}
+
     def size(self) -> int:
         with self._lock:
             return len(self._entries)
@@ -395,6 +457,8 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, log.entry(int(parts[2]) if parts[2].isdigit() else parts[2]).as_json())
                 if len(parts) == 4 and parts[:3] == ["v1", "proof", "inclusion"]:
                     return self._send(200, log.proof(int(parts[3]) if parts[3].isdigit() else parts[3]))
+                if len(parts) == 3 and parts[:2] == ["v1", "evidence"]:
+                    return self._send(200, log.evidence(_decimal_int(parts[2], "index")))
                 if self.path.split("?", 1)[0] == "/v1/proof/consistency":
                     old_size, new_size = parse_consistency_query(self.path.split("?", 1)[1] if "?" in self.path else "")
                     return self._send(200, log.consistency(old_size, new_size))

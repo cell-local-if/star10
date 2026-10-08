@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 
 from auditlog import (AuditLog, EntryNotFound, InvalidRequest, inclusion_proof, merkle_root,
-                      verify_consistency, verify_inclusion)
+                      verify_consistency, verify_entry_evidence, verify_inclusion)
 
 
 class MerkleUnitTests(unittest.TestCase):
@@ -402,6 +402,164 @@ class ConsistencyProofTests(unittest.TestCase):
     def test_unknown_route_still_404(self) -> None:
         self.assertEqual(self.call("/v1/proof/consistency/")[0], 404)
         self.assertEqual(self.call("/v1/proof/unknown?from=0&to=1")[0], 404)
+
+
+class EvidenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from auditlog import serve
+
+        cls.server = serve(port=0)
+        cls.port = cls.server.server_address[1]
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.log = cls.server.log
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+
+    def setUp(self) -> None:
+        with self.log._lock:
+            self.log._entries.clear()
+
+    def call(self, path: str):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read() or b"{}")
+
+    def append(self, n: int) -> None:
+        for i in range(n):
+            self.log.append({"n": i, "note": "x" * i})
+
+    def test_evidence_verifies_offline_for_every_index(self) -> None:
+        self.append(9)
+        for index in range(9):
+            status, body = self.call(f"/v1/evidence/{index}")
+            self.assertEqual(status, 200, body)
+            self.assertEqual(set(body), {"entry", "size", "root", "proof"})
+            self.assertEqual(set(body["entry"]), {"index", "hash", "prev_hash", "payload"})
+            self.assertEqual(body["entry"]["index"], index)
+            self.assertEqual(body["entry"]["payload"], {"n": index, "note": "x" * index})
+            self.assertEqual(body["size"], 9)
+            self.assertEqual(body["root"], self.log.root()["root"])
+            for node in body["proof"]:
+                self.assertIn(node["position"], ("left", "right"))
+                self.assertEqual(len(node["hash"]), 64)
+            self.assertTrue(verify_entry_evidence(body), index)
+
+    def test_empty_object_and_array_payloads_are_legal(self) -> None:
+        self.log.append({})
+        self.log.append([])
+        self.log.append([{}, []])
+        for index in range(3):
+            _, body = self.call(f"/v1/evidence/{index}")
+            self.assertTrue(verify_entry_evidence(body), index)
+
+    def test_evidence_is_stable_across_later_appends(self) -> None:
+        self.append(5)
+        _, before = self.call("/v1/evidence/3")
+        self.append(10)
+        _, after = self.call("/v1/evidence/3")
+        self.assertEqual(before["entry"], after["entry"])
+        self.assertTrue(verify_entry_evidence(before))
+        self.assertTrue(verify_entry_evidence(after))
+        # size/root reflect their own snapshot; both remain valid evidence
+        self.assertLess(before["size"], after["size"])
+
+    def test_index_out_of_range_is_404(self) -> None:
+        self.append(2)
+        for path in ("/v1/evidence/2", "/v1/evidence/99"):
+            status, body = self.call(path)
+            self.assertEqual(status, 404, path)
+            self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_empty_log_has_no_evidence(self) -> None:
+        status, body = self.call("/v1/evidence/0")
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_malformed_index_is_400(self) -> None:
+        self.append(3)
+        for raw in ("-1", "+1", "1.0", "1e1", "0x1", "abc", "%201", "1%20", ""):
+            path = f"/v1/evidence/{raw}"
+            status, body = self.call(path)
+            if raw == "":
+                self.assertEqual(status, 404, path)  # no index segment at all
+            else:
+                self.assertEqual(status, 400, path)
+                self.assertEqual(body["error"]["code"], "invalid_request", path)
+
+    def test_unknown_route_still_404(self) -> None:
+        self.assertEqual(self.call("/v1/evidence")[0], 404)
+        self.assertEqual(self.call("/v1/evidence/0/extra")[0], 404)
+
+    def test_tampered_evidence_is_rejected(self) -> None:
+        self.append(6)
+        _, good = self.call("/v1/evidence/2")
+
+        def mutated(**changes):
+            import copy
+            evil = copy.deepcopy(good)
+            for key, value in changes.items():
+                if key == "entry":
+                    evil["entry"].update(value)
+                else:
+                    evil[key] = value
+            return evil
+
+        zero = "0" * 64
+        bad = [
+            mutated(size=0), mutated(size=2),                     # index must be < size
+            mutated(size=-1), mutated(size="6"), mutated(size=True),
+            mutated(root="g" * 64), mutated(root=zero),
+            mutated(proof=[]), mutated(proof=good["proof"][:-1]),
+            mutated(proof=list(reversed(good["proof"]))),
+            mutated(entry={"hash": "f" * 64}),
+            mutated(entry={"prev_hash": zero}),                   # breaks the chain
+            mutated(entry={"payload": {"n": 999}}),               # leaf hash mismatch
+            mutated(entry={"index": 6}),                          # index >= size
+            mutated(entry={"index": -1}), mutated(entry={"index": "2"}),
+        ]
+        flipped = [dict(node) for node in good["proof"]]
+        flipped[0]["position"] = "left" if flipped[0]["position"] == "right" else "right"
+        bad.append(mutated(proof=flipped))
+        for evil in bad:
+            self.assertIs(verify_entry_evidence(evil), False, evil)
+
+    def test_first_entry_prev_hash_must_be_zero(self) -> None:
+        self.append(3)
+        _, body = self.call("/v1/evidence/0")
+        self.assertEqual(body["entry"]["prev_hash"], "0" * 64)
+        self.assertTrue(verify_entry_evidence(body))
+        body["entry"]["prev_hash"] = "0" * 63 + "1"
+        self.assertIs(verify_entry_evidence(body), False)
+
+    def test_malformed_evidence_returns_false_not_raise(self) -> None:
+        self.append(2)
+        _, good = self.call("/v1/evidence/1")
+        zero = "0" * 64
+        bad = [
+            None, "x", [], 0, {},
+            {"entry": good["entry"], "size": 2, "root": zero},                    # missing proof
+            {"entry": good["entry"], "size": 2, "root": zero, "proof": [], "x": 1},  # unknown field
+            {"entry": {"index": 1, "hash": zero, "prev_hash": zero}, "size": 2, "root": zero, "proof": []},
+            {"entry": {"index": 1, "hash": zero, "prev_hash": zero, "payload": None}, "size": 2, "root": zero, "proof": []},
+            {"entry": {"index": 1, "hash": zero, "prev_hash": zero, "payload": "s"}, "size": 2, "root": zero, "proof": []},
+            {"entry": {"index": 1, "hash": zero, "prev_hash": zero, "payload": 3}, "size": 2, "root": zero, "proof": []},
+            {"entry": {"index": 1, "hash": zero, "prev_hash": zero, "payload": {"a": object()}},
+             "size": 2, "root": zero, "proof": []},
+            {"entry": {"index": 1, "hash": zero, "prev_hash": "F" * 64, "payload": {}}, "size": 2, "root": zero, "proof": []},
+            {"entry": {"index": 1, "hash": zero, "prev_hash": zero, "payload": {}}, "size": 2, "root": zero,
+             "proof": [{"position": "up", "hash": zero}]},
+            {"entry": {"index": 1, "hash": zero, "prev_hash": zero, "payload": {}}, "size": 2, "root": zero,
+             "proof": [{"position": "left", "hash": zero, "extra": 1}]},
+            {"entry": {"index": 1, "hash": zero, "prev_hash": zero, "payload": {}}, "size": 2, "root": zero,
+             "proof": [None]},
+        ]
+        for evil in bad:
+            self.assertIs(verify_entry_evidence(evil), False, evil)
 
 
 if __name__ == "__main__":
