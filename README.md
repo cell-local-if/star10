@@ -84,6 +84,33 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
   纯函数，只依赖 `leaf_hash`/`node_hash`/`merkle_root` 与上述字段；非法输入（尺寸、长度或十六进制格式错误、
   节点被替换、顺序颠倒等）一律返回 `False`，不抛异常。
 
+### `POST /v1/seals`
+对当前日志做一次**可验证封存（外部锚定）**：固定调用时刻的 `size`、`root`，并绑定调用方提供的外部引用与时间。
+- 请求体**只能**含 `external_ref` 与 `external_time` 两个字段，多/少字段均为 `400 invalid_request`：
+  - `external_ref`：非空字符串（null、数字、布尔、数组、对象、空串均拒绝）；
+  - `external_time`：严格为 UTC RFC3339 写法 `YYYY-MM-DDTHH:MM:SSZ`，且为真实日历日期
+    （拒绝本地时间、`+00:00`/`-08:00` 等偏移、小数秒、小写 `t`/`z`、空白、紧凑写法、RFC 2822、
+    非法月/日/时/分/秒及不存在的闰日）。
+- `201` 返回**且仅返回**五个字段：
+```json
+{"seal_id": <64 位小写十六进制>, "size": <int>, "root": <hex>,
+ "external_ref": <string>, "external_time": "YYYY-MM-DDTHH:MM:SSZ"}
+```
+  `size`、`root` 在一次锁定读取中固定；后续追加只扩大日志，不改变已返回的封存记录、条目或证明结果。
+  封存只绑定调用方提供的外部引用和时间：不引入网络时间源、持久化文件或签名密钥。
+- `seal_id` 为内容寻址标识：对**仅含** `size`、`root`、`external_ref`、`external_time` 四字段的对象按
+  `sort_keys=True, separators=(",", ":")`、`ensure_ascii=False` 生成 UTF-8 规范 JSON，再计算
+  `sha256(0x02 || canonical_json)` 的 64 位小写十六进制值（`0x02` 域前缀区别于叶哈希 `0x00` 与节点哈希 `0x01`）。
+
+### `GET /v1/seals/{seal_id}`
+- `seal_id` 只接受 64 位小写十六进制（大写、长度不对、非十六进制字符、空白等）⇒ `400 invalid_request`；
+  格式合法但不存在 ⇒ `404 not_found`；命中 ⇒ `200` 返回与创建时完全一致的五字段记录。
+- 离线校验：`verify_seal(seal) -> bool`，纯函数，不访问网络、进程状态或日志，只凭传入对象判断。
+  对象必须恰好含 `seal_id`、`size`、`root`、`external_ref`、`external_time` 五个字段：
+  `size` 为非负整数且不是布尔值，`root`/`seal_id` 为 64 位小写十六进制，`external_ref` 为非空字符串，
+  `external_time` 符合上述严格 UTC 格式，且 `seal_id` 与按上式重算的值一致。
+  任何字段缺失/多余、类型或格式错误、日期非法、标识不匹配均返回 `False`，不抛异常。
+
 ## 错误语义
 
 ```json
@@ -92,5 +119,5 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
 
 ## 未实现（后续任务候选，非固定题单）
 
-封存与外部锚定、签名与密钥轮换、保留策略与裁剪、
-并发追加下的树一致性、与外部时间源绑定、失败注入与审计。
+签名与密钥轮换、保留策略与裁剪、
+并发追加下的树一致性、失败注入与审计。

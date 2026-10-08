@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -24,6 +26,10 @@ class InvalidRequest(AuditError):
 
 
 class EntryNotFound(AuditError):
+    code, status = "not_found", 404
+
+
+class SealNotFound(AuditError):
     code, status = "not_found", 404
 
 
@@ -264,6 +270,71 @@ def verify_consistency(old_size: Any, new_size: Any, old_root: Any, new_root: An
     return used == len(proof) and old == old_root and new == new_root
 
 
+# --- Seals and external anchoring -------------------------------------------
+#
+# A seal fixes the log's current (size, root) together with a caller-supplied
+# external reference and timestamp, identified by sha256(0x02 || canonical_json)
+# over exactly those four fields.  It is content-addressed: the id recomputes
+# from the record alone, so a seal verifies fully offline.
+
+SEAL_FIELDS = ("size", "root", "external_ref", "external_time")
+
+# Exactly YYYY-MM-DDTHH:MM:SSZ: fixed shape, no offsets, no fractional seconds,
+# no whitespace or other spellings.  Calendar validity is checked separately.
+_EXTERNAL_TIME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$")
+
+
+def is_external_time(value: Any) -> bool:
+    """True iff `value` is a string in the strict UTC form YYYY-MM-DDTHH:MM:SSZ with a valid calendar date."""
+    if not isinstance(value, str):
+        return False
+    match = _EXTERNAL_TIME_RE.match(value)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second = (int(part) for part in match.groups())
+    if not (1 <= month <= 12 and 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return False
+    try:
+        datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return False  # day out of range for the month (also rejects Feb 29 in non-leap years)
+    return True
+
+
+def seal_id_of(size: int, root: str, external_ref: str, external_time: str) -> str:
+    """Content address of a seal: sha256(0x02 || canonical JSON of the four bound fields), lowercase hex."""
+    obj = {"size": size, "root": root, "external_ref": external_ref, "external_time": external_time}
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return sha256_hex(b"\x02", canonical)
+
+
+def verify_seal(seal: Any) -> bool:
+    """Offline seal check: True iff `seal` is exactly the five-field record and its seal_id recomputes.
+
+    Requires size to be a non-negative non-boolean int, root a 64-char lowercase hex string,
+    external_ref a non-empty string, external_time in the strict UTC form YYYY-MM-DDTHH:MM:SSZ,
+    and seal_id equal to sha256(0x02 || canonical JSON) over the four bound fields.  Pure: it
+    touches no network, process state or logs, and any malformed object yields False, never raises.
+    """
+    try:
+        if not isinstance(seal, dict) or set(seal) != {"seal_id", *SEAL_FIELDS}:
+            return False
+        size, root = seal["size"], seal["root"]
+        external_ref, external_time, seal_id = (seal["external_ref"], seal["external_time"],
+                                                seal["seal_id"])
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            return False
+        if not _is_hash64(root):
+            return False
+        if not isinstance(external_ref, str) or not external_ref:
+            return False
+        if not is_external_time(external_time):
+            return False
+        return _is_hash64(seal_id) and seal_id == seal_id_of(size, root, external_ref, external_time)
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class Entry:
     index: int
@@ -330,6 +401,7 @@ class AuditLog:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._entries: list[Entry] = []
+        self._seals: dict[str, dict[str, Any]] = {}
 
     def append(self, payload: Any) -> Entry:
         if payload is None or (isinstance(payload, (str, bytes)) and not payload):
@@ -436,6 +508,34 @@ class AuditLog:
         with self._lock:
             return len(self._entries)
 
+    def seal(self, external_ref: Any, external_time: Any) -> dict[str, Any]:
+        """Fix the current (size, root) together with a caller-supplied external anchor.
+
+        Size and root are read under one lock acquisition, so later appends only enlarge the log
+        and never alter a record already returned.  No network time source, files or keys are used:
+        the seal binds only the reference and time the caller provides.
+        """
+        if not isinstance(external_ref, str) or not external_ref:
+            raise InvalidRequest("external_ref must be a non-empty string")
+        if not is_external_time(external_time):
+            raise InvalidRequest("external_time must be UTC RFC3339 in the form YYYY-MM-DDTHH:MM:SSZ")
+        with self._lock:
+            leaves = [entry.hash for entry in self._entries]
+            size, root = len(leaves), merkle_root(leaves)
+            seal_id = seal_id_of(size, root, external_ref, external_time)
+            record = {"seal_id": seal_id, "size": size, "root": root,
+                      "external_ref": external_ref, "external_time": external_time}
+            self._seals[seal_id] = record
+            return dict(record)
+
+    def seal_record(self, seal_id: Any) -> dict[str, Any]:
+        if not _is_hash64(seal_id):
+            raise InvalidRequest("seal_id must be 64 lowercase hex characters")
+        with self._lock:
+            if seal_id not in self._seals:
+                raise SealNotFound(f"no seal {seal_id}")
+            return dict(self._seals[seal_id])
+
 
 def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -486,6 +586,8 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                     raw_index = parts[2]
                     evidence_index = int(raw_index) if all("0" <= ch <= "9" for ch in raw_index) else raw_index
                     return self._send(200, log.evidence(evidence_index))
+                if len(parts) == 3 and parts[:2] == ["v1", "seals"]:
+                    return self._send(200, log.seal_record(parts[2]))
                 if len(parts) == 4 and parts[:3] == ["v1", "proof", "inclusion"]:
                     return self._send(200, log.proof(int(parts[3]) if parts[3].isdigit() else parts[3]))
                 if self.path.split("?", 1)[0] == "/v1/proof/consistency":
@@ -503,13 +605,19 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             try:
                 parts = self._parts()
-                if parts != ["v1", "entries"]:
+                if parts not in (["v1", "entries"], ["v1", "seals"]):
                     return self._send(404, {"error": {"code": "not_found"}})
                 body = self._read_json()
-                if not isinstance(body, dict) or set(body) != {"payload"}:
-                    raise InvalidRequest("body must be {\"payload\": <object|array>}")
-                entry = log.append(body["payload"])
-                return self._send(201, {"entry": entry.as_json(), **log.root()})
+                if parts == ["v1", "entries"]:
+                    if not isinstance(body, dict) or set(body) != {"payload"}:
+                        raise InvalidRequest("body must be {\"payload\": <object|array>}")
+                    entry = log.append(body["payload"])
+                    return self._send(201, {"entry": entry.as_json(), **log.root()})
+                if not isinstance(body, dict) or set(body) != {"external_ref", "external_time"}:
+                    raise InvalidRequest("body must be {\"external_ref\": <non-empty string>, "
+                                         "\"external_time\": \"YYYY-MM-DDTHH:MM:SSZ\"}")
+                seal = log.seal(body["external_ref"], body["external_time"])
+                return self._send(201, seal)
             except AuditError as error:
                 return self._send(error.status, {"error": {"code": error.code, "message": str(error)}})
             except Exception:
