@@ -55,6 +55,26 @@ Python 3.12，**仅标准库**；`127.0.0.1`；状态在进程内存中。
   `sha256(prev_hash || leaf_hash(payload))` 不一致、或包含证明结合 `size` 重算不等于 `root`，
   一律返回 `False`，且不抛异常；合法证据还要求 `index < size`。
 
+### `GET /v1/evidence/by-hash/{entry_hash}`
+与按索引导出**完全等价**的单条证据，只是用条目链哈希（`entry.hash`）寻址，供只知道某条链哈希、
+不知道其在本次日志中下标的外部校验方使用。
+- 路径只能是 `/v1/evidence/by-hash/<64 字符>`：`entry_hash` 只接受由 `0-9`、`a-f` 组成的恰好 64 位
+  小写十六进制字符串；大写、空白、正负号、短长度、长长度、非十六进制字符或其他写法一律
+  `400 invalid_request`。缺少/增加路径段（如 `/v1/evidence/by-hash`、`/v1/evidence/by-hash/<hash>/x`）
+  或附带任何查询参数（含空查询串）同样 `400 invalid_request`。请求体不参与匹配，GET 不读取请求体，
+  也不得改变命中、未命中或格式错误的结果。
+- 格式正确但当前日志中不存在该链哈希 ⇒ `404 not_found`；查询为只读：不追加、不消耗新索引，
+  命中失败不留下任何可观察状态。
+- `200`：响应对象与 `GET /v1/evidence/{index}` **结构完全相同**——
+```json
+{"entry": {"index","hash","prev_hash","payload"}, "size": <int>, "root": <hex>,
+ "proof": [{"position":"left|right","hash":<hex>}, ...]}
+```
+  `entry.index` 是该链哈希在本次日志中的唯一下标；`size`、`root`、`proof` 与 `entry` 在**一次锁定
+  读取**的同一前缀快照上确定，并发追加不会把不同前缀的材料拼进同一响应。`proof` 可直接交给
+  `verify_entry_evidence` 离线验证；后续追加只扩大日志，已返回证据的 `size`、`root`、`proof` 固定
+  不变，证据长期有效。
+
 ### `GET /v1/proofs/inclusion?snapshot_size=<n>&start=<i>&limit=<m>`
 按**固定条目前缀**分页读取包含证明，用于批量证据导出与离线逐条校验。
 - 三个参数各出现一次：`snapshot_size`、`start` 为非负十进制整数，`limit` 为 1–100 的十进制整数；

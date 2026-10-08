@@ -451,11 +451,28 @@ class AuditLog:
         with self._lock:
             if index >= len(self._entries):
                 raise EntryNotFound(f"no entry at index {index}")
-            leaves = [e.hash for e in self._entries]
-            entry = self._entries[index]
-            size = len(leaves)
-            return {"entry": entry.as_json(), "size": size, "root": merkle_root(leaves),
-                    "proof": inclusion_proof(leaves, index)}
+            return self._evidence_locked(index)
+
+    def evidence_by_hash(self, entry_hash: Any) -> dict[str, Any]:
+        """Same portable bundle as evidence(), addressed by the entry's chain hash instead of its index.
+
+        Read-only: a hit appends nothing and a miss leaves no observable state.  The entry, its index,
+        the prefix size/root and the proof are all fixed under one lock acquisition, so the bundle
+        always describes a single snapshot even while concurrent appends enlarge the log, and the
+        bundle stays valid forever after later appends.
+        """
+        if not _is_hash64(entry_hash):
+            raise InvalidRequest("entry_hash must be 64 lowercase hexadecimal characters")
+        with self._lock:
+            index = next((i for i, entry in enumerate(self._entries) if entry.hash == entry_hash), None)
+            if index is None:
+                raise EntryNotFound(f"no entry with hash {entry_hash}")
+            return self._evidence_locked(index)
+
+    def _evidence_locked(self, index: int) -> dict[str, Any]:
+        leaves = [entry.hash for entry in self._entries]
+        return {"entry": self._entries[index].as_json(), "size": len(leaves),
+                "root": merkle_root(leaves), "proof": inclusion_proof(leaves, index)}
 
     def proofs_page(self, snapshot_size: Any, start: Any, limit: Any) -> dict[str, Any]:
         """Inclusion proofs for one page of a fixed entry prefix.
@@ -587,6 +604,15 @@ def make_handler(log: AuditLog) -> type[BaseHTTPRequestHandler]:
                     return self._send(200, log.root())
                 if len(parts) == 3 and parts[:2] == ["v1", "entries"]:
                     return self._send(200, log.entry(int(parts[2]) if parts[2].isdigit() else parts[2]).as_json())
+                pathname, sep, _ = self.path.partition("?")
+                raw_segments = pathname.split("/")
+                if raw_segments[1:4] == ["v1", "evidence", "by-hash"]:
+                    # Exact shape only: /v1/evidence/by-hash/<entry_hash>, no missing/extra
+                    # (even empty) segments and no query string; raw segments keep trailing
+                    # slashes visible, unlike the empty-filtered parts used by other routes.
+                    if len(raw_segments) != 5 or not raw_segments[4] or sep:
+                        raise InvalidRequest("path must be /v1/evidence/by-hash/{entry_hash} with no query")
+                    return self._send(200, log.evidence_by_hash(raw_segments[4]))
                 if len(parts) == 3 and parts[:2] == ["v1", "evidence"]:
                     raw_index = parts[2]
                     evidence_index = int(raw_index) if all("0" <= ch <= "9" for ch in raw_index) else raw_index
